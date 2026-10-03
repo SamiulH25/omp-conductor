@@ -46,7 +46,7 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-omp` ski
 | `explore` | read, grep, glob, find (read-only) | no | Long `FINDINGS:` report: file:line evidence, quoted code, what was searched and not found, verified vs inferred. Never summarized or compressed |
 | `review` | read, grep, glob, find (read-only) | no | `FINDINGS:` ordered by severity, each with file:line, failure scenario and fix. Never summarized or compressed |
 
-Detailed types (`explore`, `review`) show the whole report in `omp_digest` (first 6000 chars; `detail: "full"` gives 20000) and a count of files read; the Haiku compression is only ever used for `general` and `dev`. The type shows on the worker card. Types are defined in the `AGENTS` table in `hooks/register.tsx`.
+Detailed types (`explore`, `review`) show the whole report in `omp_digest` (a 60000-char guard applies; `detail: "full"` raises it to 200000) and a count of files read; the Haiku compression is only ever used for `general` and `dev`. The type shows on the worker card. Types are defined in the `AGENTS` table in `hooks/register.tsx`.
 
 ## How it talks to omp
 

@@ -78,8 +78,8 @@ const AGENTS: Record<string, AgentType> = {
   },
 }
 const DEFAULT_AGENT = 'general'
-const REPORT_CHARS = 6000 // a detailed report shown by default
-const REPORT_CHARS_FULL = 20000 // ... with detail:"full"
+const REPORT_CHARS = 60000 // a detailed report is shown whole; this is only a runaway guard (~15k tokens)
+const REPORT_CHARS_FULL = 200000 // ... with detail:"full", and the most the store keeps
 
 const workersAtom = atom({ plugin: 'omp-conductor', key: 'workers' } as const, [])
 const frameAtom = atom({ plugin: 'omp-conductor', key: 'frame' } as const, 0)
