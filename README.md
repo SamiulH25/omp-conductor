@@ -21,7 +21,7 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-omp` ski
 
 | Tool | What it does |
 |---|---|
-| `omp_spawn` | Start a worker in the background (`task`, `dir`, `title`, `maxMinutes`, `worktree`). Returns an id at once. |
+| `omp_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`). Returns an id at once. |
 | `omp_status` | One line per worker, with live tok/s and cost, plus the session total. |
 | `omp_digest` | Compact report: files, commands, errors, git status, and the worker's own summary (when a worker gives none and its reply is long, Claude Haiku compresses it, labelled `summary (haiku)`). `detail: "full"` adds recent events. |
 | `omp_wait` | Wait up to 90 s for workers, then return digests. |
@@ -34,6 +34,19 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-omp` ski
 `/omp-model` shows the current worker model. `/omp-model <name>` switches it (a full `provider/model` selector or part of a name; it searches `omp models`, shows the price, and asks for the exact selector if several match). `/omp-model reset` restores the default. The choice is kept across sessions and applies to every worker started or resumed afterwards; running workers keep theirs.
 
 `/conductor` opens a pane with a card per worker: an animated avatar (four species, with faces for running, done, failed and stopped), what it is working on, an animated progress bar, live speed (⚡ tok/s with a sparkline), files, tokens, cost and model. A footer keeps the cost, tokens and worker count for the whole session, including workers you have already cleaned up. `/conductor demo` toggles sample workers in every state so you can preview it. The status line shows counts.
+
+## Agent types
+
+`omp_spawn` takes an `agent` type. Each type is a hard tool allowlist (omp `--tools`, so it is enforced, not just requested), a stated role appended to the system prompt, and a reporting style.
+
+| Type | Tools | Worktree | Reports |
+|---|---|---|---|
+| `general` (default) | all | when in a git repo | Short `SUMMARY:` (the behaviour before agent types) |
+| `dev` | read, grep, glob, find, edit, write, bash, todo | when in a git repo | Short `SUMMARY:` of what changed. Told not to commit, push or touch unrelated files |
+| `explore` | read, grep, glob, find (read-only) | no | Long `FINDINGS:` report: file:line evidence, quoted code, what was searched and not found, verified vs inferred. Never summarized or compressed |
+| `review` | read, grep, glob, find (read-only) | no | `FINDINGS:` ordered by severity, each with file:line, failure scenario and fix. Never summarized or compressed |
+
+Detailed types (`explore`, `review`) show the whole report in `omp_digest` (first 6000 chars; `detail: "full"` gives 20000) and a count of files read; the Haiku compression is only ever used for `general` and `dev`. The type shows on the worker card. Types are defined in the `AGENTS` table in `hooks/register.tsx`.
 
 ## How it talks to omp
 
@@ -48,8 +61,8 @@ Each worker is `omp -p --mode json --cwd <dir> --approval-mode yolo --thinking h
 - Every worker always runs with `--thinking high` (the `THINKING` constant in `hooks/register.tsx`).
 - Cost comes from omp's own per-turn usage numbers and is shown on every card, in the digest, in `omp_status`, in the status line and as a session total. The session total lives in session state, so it survives hot reloads and resets with a new session.
 - Workers only ever use one model: `opencode-go/deepseek-v4.1-flash` by default (`DEFAULT_MODEL` in `hooks/register.tsx`). Claude cannot pick another per task. The one other model the plugin touches is Claude Haiku, used only to compress a long worker reply that has no summary of its own (a short call through your Claude session, not an omp worker). Change it with `/omp-model` (below).
-- Every task gets a short "end with a SUMMARY block" instruction appended, so the worker simplifies its own work.
-- At most 4 concurrent workers, each with a hard time limit (default 20 min). Directories must be under your home directory or `/tmp`, and not `.ssh`, `.gnupg`, `.aws`, `.kube` or `.docker`.
+- Every task gets its agent type's reporting instruction appended: a short `SUMMARY:` block for `general` and `dev`, a complete `FINDINGS:` report for `explore` and `review`.
+- At most 4 concurrent workers, each with a hard time limit (default 20 min; 15 for `explore` and `review`). Directories must be under your home directory or `/tmp`, and not `.ssh`, `.gnupg`, `.aws`, `.kube` or `.docker`.
 - Workers auto-approve all tool calls (`--approval-mode yolo`; `write` mode blocks bash in headless runs), which is why they run in worktrees by default.
 - A wake-up prompt is sent when workers finish and you have not already reviewed them. It is held until Claude's turn ends.
 - Worker records are scoped to the Claude session (stored under the session id), so sessions never see or overwrite each other's workers, and the 4-worker cap is per session. They survive a hot reload; a worker that was running is marked "interrupted" and `omp_send` can resume it. Records of sessions untouched for 14 days are pruned. Worktrees stay on disk until `omp_cleanup`.

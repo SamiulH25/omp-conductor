@@ -22,6 +22,65 @@ const SUFFIX =
   '\n\n---\nWhen you are finished, end your final reply with a block starting with the line "SUMMARY:" followed by at most 5 short bullets: what you did, files created or changed, anything that failed or was skipped, open questions. Plain text, under 120 words.'
 const SUMMARY_RE = /(?:^|\n)[#*\s]*SUMMARY:?[*\s]*\n?([\s\S]*)$/
 
+// Agent types: what a worker may do (a hard --tools allowlist plus a stated role) and how it reports back.
+// 'summary' types condense their own work; 'detailed' types return the full report and are never compressed.
+type AgentType = {
+  about: string
+  tools?: string[] // omp --tools allowlist; undefined = every tool
+  worktree: boolean | 'auto' // default isolation ('auto' = a worktree when dir is a git repo)
+  report: 'summary' | 'detailed'
+  maxMinutes: number
+  role: string // appended to the system prompt: states the permissions and working style
+  suffix: string // appended to the task: how to end the final reply
+}
+
+const READ_ONLY = ['read', 'grep', 'glob', 'find']
+const READ_ONLY_ROLE =
+  'PERMISSIONS: read-only. You can read, search and list files; you cannot and must not modify, create or delete anything, run builds or change any state. Your tools are restricted accordingly; do not try to work around that. If the task needs a change, describe the change and where it belongs instead of making it.'
+const DETAILED_RULES =
+  'Your supervisor cannot see what you looked at, so the report is the only thing it gets. Do NOT condense it: length is fine, omission is not. Mark every claim as verified (you read it) or inferred.'
+
+const AGENTS: Record<string, AgentType> = {
+  general: {
+    about: 'unrestricted, short SUMMARY (the pre-agent-types behaviour)',
+    worktree: 'auto',
+    report: 'summary',
+    maxMinutes: 20,
+    role: '',
+    suffix: SUFFIX,
+  },
+  dev: {
+    about: 'implements changes: read, edit, write, shell; short SUMMARY of what changed. Worktree by default',
+    tools: [...READ_ONLY, 'edit', 'write', 'bash', 'todo'],
+    worktree: 'auto',
+    report: 'summary',
+    maxMinutes: 20,
+    role: 'You are a dev agent. PERMISSIONS: you may read, edit and create files and run shell commands, only inside the working directory and only for what the task asks. Do not touch unrelated files, do not install global packages, do not run git commit, push, checkout or reset (the supervisor commits and merges), and do not delete anything outside the task. Verify your work with the tests or checks named in the task before you finish.',
+    suffix: SUFFIX,
+  },
+  explore: {
+    about: 'read-only investigator: finds and reads code, returns a long evidence-backed FINDINGS report (never summarized). No worktree',
+    tools: READ_ONLY,
+    worktree: false,
+    report: 'detailed',
+    maxMinutes: 15,
+    role: `You are an explore agent. ${READ_ONLY_ROLE} METHOD: be exhaustive. Follow references and call chains to the end, try several naming conventions and search terms before concluding something is absent, and read the actual code rather than guessing from file names. Cite file:line for every claim.`,
+    suffix: `\n\n---\nWhen you are finished, end your final reply with a block starting with the line "FINDINGS:" holding your complete report: every relevant file with line numbers, short code or signatures quoted verbatim, how the pieces connect, what you searched for and did not find, and open questions or uncertainty. ${DETAILED_RULES}`,
+  },
+  review: {
+    about: 'read-only reviewer: returns every issue found with file:line, severity and a fix (never summarized). No worktree',
+    tools: READ_ONLY,
+    worktree: false,
+    report: 'detailed',
+    maxMinutes: 15,
+    role: `You are a review agent. ${READ_ONLY_ROLE} METHOD: read the code under review in full and check each claim against what it actually does. Look for correctness bugs, unhandled edge cases, broken contracts with callers, and missing tests. Do not pad with style nitpicks.`,
+    suffix: `\n\n---\nWhen you are finished, end your final reply with a block starting with the line "FINDINGS:" listing every issue, most severe first. For each: severity (high/medium/low), file:line, what is wrong, a concrete failure scenario, and a suggested fix. Then list what you checked that was fine. ${DETAILED_RULES}`,
+  },
+}
+const DEFAULT_AGENT = 'general'
+const REPORT_CHARS = 6000 // a detailed report shown by default
+const REPORT_CHARS_FULL = 20000 // ... with detail:"full"
+
 const workersAtom = atom({ plugin: 'omp-conductor', key: 'workers' } as const, [])
 const frameAtom = atom({ plugin: 'omp-conductor', key: 'frame' } as const, 0)
 const demoAtom = atom({ plugin: 'omp-conductor', key: 'demo' } as const, false)
@@ -42,6 +101,8 @@ type Worker = {
   summary?: string
   session?: string
   model?: string
+  agent: string
+  reads: Set<string>
   state: State
   startedAt: number
   endedAt?: number
@@ -146,6 +207,7 @@ export const register: Register = on => {
       cost: w.cost,
       errors: w.errors.length,
       model: w.model?.split('/').at(-1),
+      agent: w.agent === DEFAULT_AGENT ? undefined : w.agent,
       note: firstBullet(ownSummary(w) ?? w.summary),
       err: w.errors.at(-1) ? clip(one(w.errors.at(-1)!), 80) : undefined,
       tps: (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps,
@@ -229,9 +291,9 @@ export const register: Register = on => {
         const file = target(args)
         const out = ((ev.result?.content ?? []) as { text?: string }[]).map(c => c?.text ?? '').join('')
         const name = tool.toLowerCase()
-        if (file && FILE_TOOLS.has(name) && !ev.isError) {
+        if (file && !ev.isError && (FILE_TOOLS.has(name) || name === 'read')) {
           const base = `${workDir(w)}/`
-          w.files.add(file.startsWith(base) ? file.slice(base.length) : file)
+          ;(name === 'read' ? w.reads : w.files).add(file.startsWith(base) ? file.slice(base.length) : file)
         }
         const cmd = typeof args.command === 'string' ? args.command : undefined
         if (name === 'bash' && cmd) {
@@ -282,7 +344,8 @@ export const register: Register = on => {
   // ---------------------------------------------------------------- digest
   const digest = async (w: Worker, full = false) => {
     const lines: string[] = []
-    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) session=${w.session ?? '?'}`)
+    const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}`)
     lines.push(`dir: ${workDir(w)}${w.worktree ? ' (worktree)' : ''}`)
     const files = [...w.files]
     if (files.length) {
@@ -290,6 +353,7 @@ export const register: Register = on => {
         `wrote/edited ${files.length}: ${files.slice(0, FILE_LIMIT).join(', ')}${files.length > FILE_LIMIT ? ', …' : ''}`,
       )
     }
+    if (kind.report === 'detailed' && w.reads.size) lines.push(`read ${w.reads.size} file${w.reads.size === 1 ? '' : 's'}`)
     if (w.commands.length) {
       lines.push(
         `commands ${w.commands.length}, last: ${w.commands
@@ -314,7 +378,11 @@ export const register: Register = on => {
     lines.push(`steps ${w.steps}, tokens in/out ${w.tokensIn}/${w.tokensOut}${avg}, cost ${money(w.cost)}`)
     const final = w.texts.at(-1)?.trim()
     const own = ownSummary(w)
-    if (own) {
+    if (kind.report === 'detailed' && final && w.state !== 'running') {
+      // Explore and review agents: the whole report, never compressed.
+      const cap = full ? REPORT_CHARS_FULL : REPORT_CHARS
+      lines.push(`report${final.length > cap ? ` (first ${cap} of ${final.length} chars; detail:"full" for more)` : ''}:`, clip(final, cap))
+    } else if (own) {
       lines.push(`summary (worker's own): ${clip(own, 800)}`)
     } else if (final && w.state !== 'running' && final.length > FINAL_CHARS && !full) {
       w.summary ??= await B?.summarize(final)
@@ -324,7 +392,7 @@ export const register: Register = on => {
     } else if (final) {
       lines.push(`final: ${clip(final, full ? 4000 : FINAL_CHARS)}`)
     } else lines.push(`last action: ${w.last || 'none yet'}`)
-    if (full && own && final) lines.push(`full final: ${clip(final, 4000)}`)
+    if (full && own && final && kind.report !== 'detailed') lines.push(`full final: ${clip(final, 4000)}`)
     if (full) lines.push('--- events ---', ...w.events.slice(-60))
     return lines.join('\n')
   }
@@ -364,17 +432,19 @@ export const register: Register = on => {
       branch: w.branch,
       session: w.session,
       model: w.model,
+      agent: w.agent,
       state: w.state,
       startedAt: w.startedAt,
       endedAt: w.endedAt,
       files: [...w.files],
+      reads: [...w.reads].slice(0, 200),
       commands: w.commands.slice(-10),
       errors: w.errors.slice(-5),
       last: w.last,
       steps: w.steps,
       tokensIn: w.tokensIn,
       tokensOut: w.tokensOut,
-      finalText: clip(w.texts.at(-1) ?? '', 4000),
+      finalText: clip(w.texts.at(-1) ?? '', AGENTS[w.agent]?.report === 'detailed' ? REPORT_CHARS_FULL : 4000),
       summary: w.summary,
       outTokens: w.outTokens,
       genMs: w.genMs,
@@ -392,7 +462,9 @@ export const register: Register = on => {
         const was = r.state === 'running'
         workers.set(r.id, {
           ...r,
+          agent: AGENTS[r.agent] ? r.agent : DEFAULT_AGENT,
           files: new Set(r.files),
+          reads: new Set(r.reads ?? []),
           texts: r.finalText ? [r.finalText] : [],
           events: [],
           stderr: '',
@@ -509,8 +581,11 @@ export const register: Register = on => {
         w.model = currentModel
         argv.push('--model', currentModel)
         argv.push('--thinking', THINKING)
+        const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+        if (kind.tools) argv.push('--tools', kind.tools.join(','))
+        if (kind.role) argv.push('--append-system-prompt', kind.role)
         if (w.session) argv.push('--resume', w.session)
-        const body = message + SUFFIX
+        const body = message + kind.suffix
         argv.push(body.startsWith('-') ? `Task: ${body}` : body)
 
         void (async () => {
@@ -576,10 +651,15 @@ export const register: Register = on => {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
           dir: { type: 'string', description: 'Working directory (default: session cwd)' },
           title: { type: 'string', description: 'Short label' },
-          maxMinutes: { type: 'number', description: 'hard time limit for the run (default 20)' },
+          agent: {
+            type: 'string',
+            enum: Object.keys(AGENTS),
+            description: `Agent type (default ${DEFAULT_AGENT}). ${Object.entries(AGENTS).map(([k, a]) => `${k}: ${a.about}`).join('; ')}`,
+          },
+          maxMinutes: { type: 'number', description: 'hard time limit for the run (default depends on agent type, 15-20)' },
           worktree: {
             type: 'boolean',
-            description: 'Isolate in a new git worktree (default true when dir is a git repo)',
+            description: 'Isolate in a new git worktree (default depends on agent type; dev and general: true when dir is a git repo, explore and review: false)',
           },
         },
         ['task'],
@@ -728,6 +808,9 @@ export const register: Register = on => {
     if (running() >= MAX_WORKERS) {
       return text(`max ${MAX_WORKERS} concurrent workers; wait for one to finish first`, true)
     }
+    const agent = String(e.agent ?? DEFAULT_AGENT)
+    const kind = AGENTS[agent]
+    if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
     const dir = String(e.dir ?? cwd)
     if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
     if (!(await insideRoots(dir))) {
@@ -741,7 +824,7 @@ export const register: Register = on => {
     const isGit = top?.exitCode === 0
     let worktree: string | undefined
     let branch: string | undefined
-    const wantTree = e.worktree === undefined ? isGit : e.worktree === true
+    const wantTree = e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
     if (wantTree) {
       if (!isGit) return text('worktree requested but dir is not a git repo', true)
       const root = top!.stdout.trim()
@@ -766,9 +849,11 @@ export const register: Register = on => {
       worktree,
       branch,
       model: currentModel,
+      agent,
       state: 'running',
       startedAt: Date.now(),
       files: new Set(),
+      reads: new Set(),
       commands: [],
       errors: [],
       texts: [],
@@ -782,7 +867,7 @@ export const register: Register = on => {
       outTokens: 0,
       genMs: 0,
       spark: [],
-      maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : undefined,
+      maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
       cost: 0,
       sawEnd: false,
       turnChars: 0,
@@ -794,7 +879,7 @@ export const register: Register = on => {
     void B?.ledger(0, 0, 1)
     B?.launch(w, task)
     await sync()
-    return text(`started ${id} "${w.title}" in ${workDir(w)}`)
+    return text(`started ${id} [${agent}] "${w.title}" in ${workDir(w)}`)
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__omp_status' }, async $ => {
@@ -1062,6 +1147,7 @@ export const register: Register = on => {
         w.tokens ? `${kilo(w.tokens)} tok` : undefined,
         money(w.cost ?? 0),
         w.errors ? `${w.errors} err` : undefined,
+        w.agent,
         w.model,
       ]
         .filter(Boolean)

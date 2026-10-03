@@ -10,6 +10,7 @@ export type WorkerView = {
   cost: number
   errors: number
   model?: string
+  agent?: string
   note?: string
   err?: string
   tps?: number
