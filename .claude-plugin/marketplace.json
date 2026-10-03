@@ -1,0 +1,12 @@
+{
+  "name": "omp-conductor-marketplace",
+  "owner": { "name": "bob2142" },
+  "metadata": { "description": "Local marketplace for the omp-conductor plugin." },
+  "plugins": [
+    {
+      "name": "omp-conductor",
+      "source": "./plugins/omp-conductor",
+      "description": "Claude orchestrates multiple omp workers: parallel runs in git worktrees, compact digests, live tok/s, review, merge, cleanup."
+    }
+  ]
+}
