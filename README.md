@@ -11,7 +11,7 @@ A Claude Code plugin that lets Claude run several [omp](https://github.com/can13
 ## Install
 
 ```
-claude plugin marketplace add /path/to/omp-conductor
+claude plugin marketplace add SamiulH25/omp-conductor
 claude plugin install omp-conductor@omp-conductor-marketplace
 ```
 
