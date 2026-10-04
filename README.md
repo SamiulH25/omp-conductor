@@ -29,11 +29,14 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-omp` ski
 | `omp_diff` | `git diff` of a worker's directory, for review. |
 | `omp_merge` | Commit the worker's changes and merge its branch `--no-ff`; aborts cleanly on conflict. |
 | `omp_cleanup` | Remove the worktree and branch and forget the worker; refuses unmerged work unless `force`. |
+| `omp_dict` | Project dictionary: `show`, `set` (upsert `{term, definition}` entries) or `remove`. Kept per project root (git toplevel) in the plugin store and injected into every worker's system prompt. The orchestrator seeds it before the first spawn and adds only reviewed facts. Capped at 6000 chars, 300 per entry. |
 | `omp_kill` | Stop a worker and everything it started. |
 
 `/omp-model` shows the current worker model. `/omp-model <name>` switches it (a full `provider/model` selector or part of a name; it searches `omp models`, shows the price, and asks for the exact selector if several match). `/omp-model reset` restores the default. The choice is kept across sessions and applies to every worker started or resumed afterwards; running workers keep theirs.
 
-`/conductor` opens a pane with a card per worker: an animated avatar (four species, with faces for running, done, failed and stopped), what it is working on, an animated progress bar, live speed (⚡ tok/s with a sparkline), files, tokens, cost and model. A footer keeps the cost, tokens and worker count for the whole session, including workers you have already cleaned up. `/conductor demo` toggles sample workers in every state so you can preview it. The status line shows counts.
+`/omp-effort` shows the reasoning effort workers use. `/omp-effort <off|minimal|low|medium|high|xhigh|max|auto>` switches it (omp `--thinking` levels; warns if the current model does not list the level). `/omp-effort reset` restores `high`. Kept across sessions and applied to workers started or resumed afterwards.
+
+`/conductor` opens a pane with a card per worker: an animated avatar (four species, with faces for running, done, failed and stopped), what it is working on, an animated progress bar, live speed (⚡ tok/s with a sparkline), files, tokens, cost and model. A footer keeps the cost, tokens and worker count for the whole session, including workers you have already cleaned up. The avatar reacts to what the worker is doing: eyes sweep while it reads or searches, squint and "type" while it edits, go wide on shell commands, look up with a thinking indicator between tools, and blink slowly after 10 s of silence. One-shot reactions show a wince on a tool error, a smile and ✓ on a file written, and a nod at the end of a turn. A badge beside the face shows the agent type (⌕ explore, ✎ review, ⚒ dev). `/conductor demo` toggles sample workers in every state so you can preview it. The status line shows counts.
 
 ## Agent types
 
@@ -50,7 +53,7 @@ Detailed types (`explore`, `review`) show the whole report in `omp_digest` (a 60
 
 ## How it talks to omp
 
-Each worker is `omp -p --mode json --cwd <dir> --approval-mode yolo --thinking high --no-title --max-time <n>m`, and the plugin reads its JSON event stream:
+Each worker is `omp -p --mode json --cwd <dir> --approval-mode yolo --thinking <effort> --no-title --max-time <n>m`, and the plugin reads its JSON event stream:
 
 - **Live speed:** characters from `text`, `toolcall` and `thinking` deltas, converted to tokens with a ratio calibrated against omp's own usage numbers. After each turn the exact rate is computed from `usage.output` over `duration - ttft`.
 - **Work:** `tool_execution_start/end` events give the files touched, commands run, errors and the current activity.
@@ -58,7 +61,7 @@ Each worker is `omp -p --mode json --cwd <dir> --approval-mode yolo --thinking h
 
 ## Behavior
 
-- Every worker always runs with `--thinking high` (the `THINKING` constant in `hooks/register.tsx`).
+- Every worker runs with the effort set by `/omp-effort`, `high` by default (`DEFAULT_THINKING` in `hooks/register.tsx`).
 - Cost comes from omp's own per-turn usage numbers and is shown on every card, in the digest, in `omp_status`, in the status line and as a session total. The session total lives in session state, so it survives hot reloads and resets with a new session.
 - Workers only ever use one model: `opencode-go/deepseek-v4.1-flash` by default (`DEFAULT_MODEL` in `hooks/register.tsx`). Claude cannot pick another per task. The one other model the plugin touches is Claude Haiku, used only to compress a long worker reply that has no summary of its own (a short call through your Claude session, not an omp worker). Change it with `/omp-model` (below).
 - Every task gets its agent type's reporting instruction appended: a short `SUMMARY:` block for `general` and `dev`, a complete `FINDINGS:` report for `explore` and `review`.

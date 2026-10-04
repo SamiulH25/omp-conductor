@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { WorkerView } from '../types'
+import type { Act, WorkerView } from '../types'
 
 const PANE = 'omp-conductor'
 const MAX_WORKERS = 4
@@ -13,9 +13,19 @@ const DENY = /\/\.(ssh|gnupg|aws|kube|docker)(\/|$)/
 // The only model workers ever use. /omp-model changes it and the choice is kept in the store.
 const SUMMARY_MODEL = 'haiku' // the one other model: compresses a long worker reply that has no SUMMARY block
 const DEFAULT_MODEL = 'opencode-go/deepseek-v4.1-flash'
-const THINKING = 'high' // every worker always reasons at this level
+const DEFAULT_THINKING = 'high' // reasoning effort workers start with; /omp-effort changes it
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto'] // omp --thinking values
 const STORE_PREFIX = 'workers:' // one store key per Claude session, so sessions never share records
+// Avatar reactions: how long a one-shot reaction shows, and which tools count as reading or editing.
+const REACT_MS = { error: 1800, write: 1200, turn: 700 } as const
+const REACT_RANK = { error: 3, write: 2, turn: 1 } as const
+const READ_TOOLS = new Set(['read', 'grep', 'glob', 'find', 'search', 'ls', 'ast_grep'])
+const SYNC_MS = 250 // minimum gap between pane syncs triggered by worker output
 const STALE_MS = 14 * 24 * 3600 * 1000
+// Project dictionary: short term -> definition entries per project root, kept in the store, injected into every worker.
+const DICT_PREFIX = 'dict:'
+const DICT_MAX_CHARS = 6000 // whole dictionary; keeps the injected context small
+const DICT_DEF_CHARS = 300 // one definition; a dictionary entry, not an essay
 
 // The worker simplifies its own work: every task ends with a SUMMARY block the digest quotes.
 const SUFFIX =
@@ -86,6 +96,7 @@ const frameAtom = atom({ plugin: 'omp-conductor', key: 'frame' } as const, 0)
 const demoAtom = atom({ plugin: 'omp-conductor', key: 'demo' } as const, false)
 // Everything the session has spent on workers, kept even after a worker is cleaned up.
 const modelAtom = atom({ plugin: 'omp-conductor', key: 'model' } as const, 'opencode-go/deepseek-v4.1-flash')
+const thinkingAtom = atom({ plugin: 'omp-conductor', key: 'thinking' } as const, 'high')
 const ledgerAtom = atom({ plugin: 'omp-conductor', key: 'ledger' } as const, { cost: 0, tokens: 0, spawned: 0 })
 
 type State = 'running' | 'done' | 'failed' | 'killed'
@@ -95,6 +106,7 @@ type Worker = {
   title: string
   task: string
   dir: string
+  root: string // git toplevel, or dir outside git; keys the project dictionary
   isGit: boolean
   worktree?: string
   branch?: string
@@ -102,6 +114,9 @@ type Worker = {
   session?: string
   model?: string
   agent: string
+  act?: Act
+  lastAt?: number // last event from omp; the avatar idles when this gets old
+  react?: { kind: keyof typeof REACT_MS; at: number }
   reads: Set<string>
   state: State
   startedAt: number
@@ -134,6 +149,7 @@ type Worker = {
 
 type Bridge = {
   sync: () => Promise<void>
+  syncSoon: () => void
   launch: (w: Worker, message: string) => void
   summarize: (text: string) => Promise<string | undefined>
   git: (
@@ -155,8 +171,10 @@ const SPECIES: Species[] = [
 ]
 
 const demoList = (now: number): WorkerView[] => [
-  { id: 'w1', title: 'lighthouse story', state: 'running', startedAt: now - 83_000, last: 'write story_lighthouse.md', files: 1, tokens: 31_200, cost: 0.0143, errors: 0, model: 'deepseek-v4.1-flash', tps: 142, tpsAt: now, avgTps: 118, spark: [90, 120, 150, 110, 160, 142] },
-  { id: 'w2', title: 'fix add() bug and add tests', state: 'running', startedAt: now - 41_000, last: 'bash python3 test_calc.py', files: 2, tokens: 18_400, cost: 0.0091, errors: 0, model: 'deepseek-v4.1-flash', tps: 87, tpsAt: now, avgTps: 95, spark: [120, 95, 70, 101, 87] },
+  { id: 'w1', title: 'lighthouse story', state: 'running', startedAt: now - 83_000, last: 'write story_lighthouse.md', files: 1, tokens: 31_200, cost: 0.0143, errors: 0, model: 'deepseek-v4.1-flash', act: 'edit', lastAt: now, agent: 'dev', react: Math.floor(now / 1000) % 6 === 0 ? { kind: 'write', at: now } : undefined, tps: 142, tpsAt: now, avgTps: 118, spark: [90, 120, 150, 110, 160, 142] },
+  { id: 'w2', title: 'fix add() bug and add tests', state: 'running', startedAt: now - 41_000, last: 'bash python3 test_calc.py', files: 2, tokens: 18_400, cost: 0.0091, errors: 0, model: 'deepseek-v4.1-flash', act: 'bash', lastAt: now, react: Math.floor(now / 1000) % 7 === 0 ? { kind: 'error', at: now } : undefined, tps: 87, tpsAt: now, avgTps: 95, spark: [120, 95, 70, 101, 87] },
+  { id: 'w6', title: 'map the save system', state: 'running', startedAt: now - 22_000, last: 'grep SaveGame', files: 0, tokens: 9_100, cost: 0.004, errors: 0, model: 'muse-spark-1.3', act: 'read', lastAt: now, agent: 'explore', tps: 64, tpsAt: now, avgTps: 60, spark: [50, 64, 70, 64] },
+  { id: 'w7', title: 'review inventory diff', state: 'running', startedAt: now - 65_000, last: 'thinking', files: 0, tokens: 22_000, cost: 0.011, errors: 0, model: 'muse-spark-1.3', act: 'think', lastAt: now - 14_000, agent: 'review', avgTps: 40, spark: [40, 38] },
   { id: 'w3', title: 'readme usage section', state: 'done', startedAt: now - 190_000, endedAt: now - 150_000, last: 'read README.md', files: 1, tokens: 17_900, cost: 0.0062, errors: 0, model: 'deepseek-v4.1-flash', note: 'Appended a Usage section with a python example', avgTps: 64, spark: [40, 88, 61, 70] },
   { id: 'w4', title: 'migrate config loader', state: 'failed', startedAt: now - 300_000, endedAt: now - 262_000, last: 'bash pytest -q', files: 3, tokens: 64_000, cost: 0.0388, errors: 2, model: 'deepseek-v4-pro', err: 'bash exit 1: pytest -q', avgTps: 51, spark: [60, 45, 52] },
   { id: 'w5', title: 'long sleeper', state: 'killed', startedAt: now - 420_000, endedAt: now - 380_000, last: 'thinking', files: 0, tokens: 0, cost: 0.0, errors: 0, model: 'deepseek-v4.1-flash' },
@@ -191,6 +209,7 @@ export const register: Register = on => {
   let turnActive = false
   let demoOn = false
   let currentModel = DEFAULT_MODEL
+  let currentThinking = DEFAULT_THINKING
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
   let seq = 0
 
@@ -214,6 +233,9 @@ export const register: Register = on => {
       tpsAt: w.state === 'running' && liveTps(w, Date.now()) ? Date.now() : w.tpsAt,
       avgTps: w.genMs > 0 ? w.outTokens / (w.genMs / 1000) : undefined,
       spark: w.spark,
+      act: w.act,
+      lastAt: w.lastAt,
+      react: w.react,
     }))
 
   const running = () => [...workers.values()].filter(w => w.state === 'running').length
@@ -226,6 +248,18 @@ export const register: Register = on => {
   const note = (w: Worker, line: string) => {
     w.events.push(clip(one(line), 200))
     if (w.events.length > MAX_EVENTS) w.events.shift()
+  }
+
+  const actOf = (tool: string): Act => {
+    const t = tool.toLowerCase()
+    return READ_TOOLS.has(t) ? 'read' : FILE_TOOLS.has(t) ? 'edit' : t === 'bash' ? 'bash' : 'tool'
+  }
+
+  // A one-shot reaction; a stronger one is not replaced by a weaker one while it is still showing.
+  const react = (w: Worker, kind: keyof typeof REACT_MS) => {
+    const cur = w.react
+    if (cur && Date.now() - cur.at < REACT_MS[cur.kind] && REACT_RANK[cur.kind] > REACT_RANK[kind]) return
+    w.react = { kind, at: Date.now() }
   }
 
   const target = (input: Record<string, unknown> | undefined) => {
@@ -256,12 +290,14 @@ export const register: Register = on => {
       note(w, `raw: ${raw}`)
       return
     }
+    w.lastAt = Date.now()
     switch (ev.type) {
       case 'session':
         if (typeof ev.id === 'string') w.session = ev.id
         break
       case 'turn_start':
         w.turnChars = 0
+        w.act = 'think'
         if (w.last === 'starting') w.last = 'thinking'
         break
       case 'message_update': {
@@ -281,6 +317,7 @@ export const register: Register = on => {
       case 'tool_execution_start': {
         const args = (ev.args ?? {}) as Record<string, unknown>
         w.toolArgs[String(ev.toolCallId)] = args
+        w.act = actOf(String(ev.toolName ?? ''))
         w.last = clip(one(`▶ ${ev.toolName} ${ev.intent ?? target(args) ?? args.command ?? ''}`), 80)
         break
       }
@@ -299,10 +336,16 @@ export const register: Register = on => {
         if (name === 'bash' && cmd) {
           w.commands.push(cmd)
           const exit = ev.result?.details?.exitCode ?? /exit(?:ed)?(?: with)?(?: code)?[: ]+(\d+)/i.exec(out)?.[1]
-          if (exit != null && Number(exit) !== 0) w.errors.push(`bash exit ${exit}: ${clip(one(cmd), 80)}`)
+          if (exit != null && Number(exit) !== 0) {
+            w.errors.push(`bash exit ${exit}: ${clip(one(cmd), 80)}`)
+            react(w, 'error')
+          }
         }
         w.last = clip(one(`${tool} ${file ?? cmd ?? ''}`), 80)
+        w.act = 'think'
+        if (file && !ev.isError && FILE_TOOLS.has(name)) react(w, 'write')
         if (ev.isError) {
+          react(w, 'error')
           const msg = clip(one(out || 'error'), 200)
           w.errors.push(`${tool}: ${msg}`)
           note(w, `ERR ${tool} ${msg}`)
@@ -331,6 +374,7 @@ export const register: Register = on => {
         }
         if (gen > 0 && w.turnChars > 20) w.ratio = 0.5 * w.ratio + 0.5 * (gen / w.turnChars)
         w.win = []
+        react(w, 'turn')
         break
       }
       case 'agent_end':
@@ -416,10 +460,14 @@ export const register: Register = on => {
 
     // Everything that needs `$` for the session's life is built here, where it is in scope.
     let wakeTimer: (() => void) | undefined
+    let syncTimer: (() => void) | undefined
     const pendingWake = new Set<string>()
 
     currentModel = String((await $.store.get('model').catch(() => undefined)) || DEFAULT_MODEL)
     await update($, modelAtom, () => currentModel)
+    const savedThinking = String((await $.store.get('thinking').catch(() => undefined)) || DEFAULT_THINKING)
+    currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
+    await update($, thinkingAtom, () => currentThinking)
     let lastSig = ''
     const storeKey = `${STORE_PREFIX}${await $.session.id()}`
     const record = (w: Worker) => ({
@@ -427,6 +475,7 @@ export const register: Register = on => {
       title: w.title,
       task: clip(w.task, 500),
       dir: w.dir,
+      root: w.root,
       isGit: w.isGit,
       worktree: w.worktree,
       branch: w.branch,
@@ -462,6 +511,7 @@ export const register: Register = on => {
         const was = r.state === 'running'
         workers.set(r.id, {
           ...r,
+          root: r.root ?? r.dir,
           agent: AGENTS[r.agent] ? r.agent : DEFAULT_AGENT,
           files: new Set(r.files),
           reads: new Set(r.reads ?? []),
@@ -498,6 +548,24 @@ export const register: Register = on => {
         }
       }
     })()
+
+    // Project dictionary: the supervisor's own glossary of the project, injected into every worker's system prompt.
+    type Dict = Record<string, { def: string; at: number }>
+    const loadDict = async (root: string): Promise<Dict> => {
+      const d = (await $.store.get(DICT_PREFIX + root).catch(() => undefined)) as Dict | undefined
+      return d && typeof d === 'object' ? d : {}
+    }
+    const dictBody = (d: Dict) =>
+      Object.entries(d)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([term, v]) => `- ${term}: ${v.def}`)
+        .join('\n')
+    const dictText = async (root: string) => {
+      const body = dictBody(await loadDict(root))
+      return body
+        ? `PROJECT DICTIONARY (kept by your supervisor: the project's terms, systems and where they live. Use it to skip re-learning the layout. It can be stale: if the code contradicts an entry, trust the code and say so in your report.)\n${body}`
+        : ''
+    }
 
     B = {
       summarize: async body => {
@@ -538,6 +606,15 @@ export const register: Register = on => {
         )
       },
 
+      // Stream chunks arrive far faster than the pane can use: coalesce them into one sync per SYNC_MS.
+      syncSoon: () => {
+        if (syncTimer) return
+        syncTimer = $.clock.after(SYNC_MS, () => {
+          syncTimer = undefined
+          void B?.sync()
+        })
+      },
+
       git: (args, dir) =>
         $.process.run(['git', ...args], { cwd: dir, timeoutMs: 30_000 }).catch(() => undefined),
 
@@ -574,21 +651,22 @@ export const register: Register = on => {
         w.isReported = false
         w.sawEnd = false
         w.win = []
-        const argv = [
-          'omp', '-p', '--mode', 'json', '--cwd', workDir(w),
-          '--approval-mode', 'yolo', '--no-title', '--max-time', `${w.maxMinutes ?? 20}m`,
-        ]
-        w.model = currentModel
-        argv.push('--model', currentModel)
-        argv.push('--thinking', THINKING)
-        const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
-        if (kind.tools) argv.push('--tools', kind.tools.join(','))
-        if (kind.role) argv.push('--append-system-prompt', kind.role)
-        if (w.session) argv.push('--resume', w.session)
-        const body = message + kind.suffix
-        argv.push(body.startsWith('-') ? `Task: ${body}` : body)
-
         void (async () => {
+          const argv = [
+            'omp', '-p', '--mode', 'json', '--cwd', workDir(w),
+            '--approval-mode', 'yolo', '--no-title', '--max-time', `${w.maxMinutes ?? 20}m`,
+          ]
+          w.model = currentModel
+          argv.push('--model', currentModel)
+          argv.push('--thinking', currentThinking)
+          const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+          if (kind.tools) argv.push('--tools', kind.tools.join(','))
+          const dict = await dictText(w.root)
+          const sys = [kind.role, dict].filter(Boolean).join('\n\n')
+          if (sys) argv.push('--append-system-prompt', sys)
+          if (w.session) argv.push('--resume', w.session)
+          const body = message + kind.suffix
+          argv.push(body.startsWith('-') ? `Task: ${body}` : body)
           let killed = false
           const it = $.process.spawn({ argv, cwd: workDir(w) })[Symbol.asyncIterator]()
           w.stop = () => {
@@ -617,7 +695,7 @@ export const register: Register = on => {
                 if (line) ingest(w, line)
                 nl = buf.indexOf('\n')
               }
-              void sync()
+              B?.syncSoon()
             }
             if (buf.trim()) ingest(w, buf.trim())
           } catch (err) {
@@ -663,6 +741,24 @@ export const register: Register = on => {
           },
         },
         ['task'],
+      ),
+    })
+    await $.tool.register({
+      name: 'omp_dict',
+      description:
+        'The project dictionary: short term -> definition entries (what a system is called, what it does, where it lives, conventions, how to run tests) that are injected into every worker for that project. Seed it from what you already understand BEFORE the first omp_spawn; after reviewing a worker, add facts you verified (never unverified worker claims). Not for task notes or history. action: show | set (upsert entries) | remove (terms).',
+      inputSchema: obj(
+        {
+          action: { type: 'string', enum: ['show', 'set', 'remove'] },
+          dir: { type: 'string', description: 'Any directory inside the project (default: session cwd)' },
+          entries: {
+            type: 'array',
+            description: `For set: [{term, definition}]. Definitions are one or two sentences (max ${DICT_DEF_CHARS} chars); name file paths.`,
+            items: obj({ term: { type: 'string' }, definition: { type: 'string' } }, ['term', 'definition']),
+          },
+          terms: { type: 'array', items: { type: 'string' }, description: 'For remove' },
+        },
+        ['action'],
       ),
     })
     await $.tool.register({
@@ -724,6 +820,7 @@ export const register: Register = on => {
 
     await $.command.register({ name: 'conductor', description: 'Show the omp-conductor workers pane' })
     await $.command.register({ name: 'omp-model', description: 'Show or change the model every omp worker uses' })
+    await $.command.register({ name: 'omp-effort', description: 'Show or change the reasoning effort every omp worker uses' })
 
     $.clock.every(1000, () => {
       if (running() > 0) void sync()
@@ -785,9 +882,33 @@ export const register: Register = on => {
     }
     const m = hits[0]!
     await set(m.selector)
-    const note = m.thinking?.length && !m.thinking.includes(THINKING) ? ` Warning: it lists thinking levels ${m.thinking.join(', ')} but workers always ask for "${THINKING}".` : ''
+    const note = m.thinking?.length && !m.thinking.includes(currentThinking) ? ` Warning: it lists thinking levels ${m.thinking.join(', ')} but workers ask for "${currentThinking}"; change it with /omp-effort.` : ''
     const price = m.cost ? ` ($${m.cost.input}/M in, $${m.cost.output}/M out)` : ''
     return { text: `worker model set to ${m.selector}${price}. Applies to workers started or resumed from now on; running workers keep theirs.${note}` }
+  })
+
+  on('command.run', { command: 'omp-effort' }, async ($, e) => {
+    const arg = String((e as { args?: string }).args ?? '').trim().toLowerCase()
+    const status = `worker effort: ${currentThinking}${currentThinking === DEFAULT_THINKING ? ' (plugin default)' : ` (plugin default is ${DEFAULT_THINKING})`}`
+    if (!arg) {
+      return { text: `${status}\nChange it: /omp-effort <${THINKING_LEVELS.join('|')}>. Reset: /omp-effort reset.` }
+    }
+    const level = arg === 'reset' || arg === 'default' ? DEFAULT_THINKING : arg
+    if (!THINKING_LEVELS.includes(level)) {
+      return { text: `unknown effort "${arg}". Levels: ${THINKING_LEVELS.join(', ')}. ${status}` }
+    }
+    currentThinking = level
+    await $.store.set('thinking', level).catch(() => undefined)
+    await update($, thinkingAtom, () => level)
+    const r = await $.process.run(['omp', 'models', 'find', currentModel.split('/').slice(1).join('/') || currentModel, '--json'], { timeoutMs: 30_000 }).catch(() => undefined)
+    let listed: string[] | null | undefined
+    try {
+      listed = (JSON.parse(r?.stdout ?? '{}').models ?? []).find((m: { selector: string }) => m.selector === currentModel)?.thinking
+    } catch {
+      listed = undefined
+    }
+    const note = listed?.length && !listed.includes(level) && level !== 'off' && level !== 'auto' ? ` Warning: ${currentModel} lists thinking levels ${listed.join(', ')}; omp may clamp "${level}".` : ''
+    return { text: `worker effort set to ${level}. Applies to workers started or resumed from now on; running workers keep theirs.${note}` }
   })
 
   on('command.run', { command: 'conductor' }, async ($, e) => {
@@ -845,6 +966,7 @@ export const register: Register = on => {
       title: String(e.title ?? clip(one(task), 40)),
       task,
       dir,
+      root: isGit ? top!.stdout.trim() : dir,
       isGit,
       worktree,
       branch,
@@ -879,7 +1001,58 @@ export const register: Register = on => {
     void B?.ledger(0, 0, 1)
     B?.launch(w, task)
     await sync()
-    return text(`started ${id} [${agent}] "${w.title}" in ${workDir(w)}`)
+    const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
+    return text(
+      `started ${id} [${agent}] "${w.title}" in ${workDir(w)}` +
+        (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with omp_dict (set) before the next spawn so workers stop re-learning the project.`),
+    )
+  })
+
+  on('tool.call', { tool: 'mcp__omp-conductor__omp_dict' }, async ($, e) => {
+    const action = String(e.action ?? '')
+    const dir = String(e.dir ?? cwd)
+    if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
+    if (!(await insideRoots(dir))) return text(`dir ${dir} is outside the allowed roots or is a protected dir`, true)
+    const top = await $.process
+      .run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: 10_000 })
+      .catch(() => undefined)
+    const root = top?.exitCode === 0 ? top.stdout.trim() : dir
+    const key = DICT_PREFIX + root
+    const dict = ((await $.store.get(key).catch(() => undefined)) as Record<string, { def: string; at: number }> | undefined) ?? {}
+    const render = () => {
+      const body = Object.entries(dict)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([term, v]) => `- ${term}: ${v.def}`)
+        .join('\n')
+      return `${root}: ${Object.keys(dict).length} entries, ${body.length}/${DICT_MAX_CHARS} chars${body ? `\n${body}` : ''}`
+    }
+    if (action === 'show') return text(render())
+    if (action === 'set') {
+      const entries = Array.isArray(e.entries) ? (e.entries as { term?: unknown; definition?: unknown }[]) : []
+      if (!entries.length) return text('entries is required for set', true)
+      const next = { ...dict }
+      for (const it of entries) {
+        const term = one(String(it.term ?? ''))
+        const def = one(String(it.definition ?? ''))
+        if (!term || !def) return text('every entry needs a term and a definition', true)
+        if (def.length > DICT_DEF_CHARS) return text(`definition of "${term}" is ${def.length} chars; keep it under ${DICT_DEF_CHARS} (point at a file instead of explaining it)`, true)
+        next[term] = { def, at: Date.now() }
+      }
+      const size = Object.entries(next).reduce((n, [t, v]) => n + t.length + v.def.length + 4, 0)
+      if (size > DICT_MAX_CHARS) return text(`dictionary would be ${size} chars (max ${DICT_MAX_CHARS}); remove or tighten entries first`, true)
+      await $.store.set(key, next).catch(() => undefined)
+      Object.assign(dict, next)
+      return text(`saved ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}. ${render().split('\n')[0]}`)
+    }
+    if (action === 'remove') {
+      const terms = Array.isArray(e.terms) ? (e.terms as unknown[]).map(t => one(String(t))) : []
+      if (!terms.length) return text('terms is required for remove', true)
+      const gone = terms.filter(t => t in dict)
+      for (const t of gone) delete dict[t]
+      await $.store.set(key, dict).catch(() => undefined)
+      return text(`removed ${gone.length}/${terms.length}. ${render().split('\n')[0]}`)
+    }
+    return text('action must be show, set or remove', true)
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__omp_status' }, async $ => {
@@ -1039,6 +1212,7 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const demo = await read($, demoAtom)
     const modelNow = await read($, modelAtom)
+    const thinkingNow = await read($, thinkingAtom)
     const realLedger = await read($, ledgerAtom)
     const real = await read($, workersAtom)
     const list = demo ? demoList(Date.now()) : real
@@ -1071,13 +1245,49 @@ export const register: Register = on => {
     const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
     const BORDER = { running: '', done: '#50fa7b', failed: '#ff5555', killed: '#6272a4' } as const
-    const faceOf = (w: { state: string; id: string }, f: number) => {
+    // The face: finished states first, then a one-shot reaction, then idle, then a pose for what the agent is doing.
+    const IDLE_MS = 10_000
+    const faceOf = (w: { state: string; act?: string; lastAt?: number; react?: { kind: keyof typeof REACT_MS; at: number } }, f: number) => {
       if (w.state === 'done') return { eyes: '^ ^', mouth: '‿' }
       if (w.state === 'failed') return { eyes: 'x x', mouth: '~' }
       if (w.state === 'killed') return { eyes: '- -', mouth: f % 8 < 4 ? 'z' : 'Z' }
+      const r = w.react && now - w.react.at < REACT_MS[w.react.kind] ? w.react.kind : undefined
+      if (r === 'error') return { eyes: '> <', mouth: '~', tint: '#ff5555' }
+      if (r === 'write') return { eyes: '^ ^', mouth: '‿', tint: '#50fa7b' }
+      if (r === 'turn') return { eyes: '_ _', mouth: '·' }
+      if (w.lastAt && now - w.lastAt > IDLE_MS) return { eyes: f % 12 < 2 ? '– –' : '◔ ◔', mouth: '·' }
       if (f % 14 === 13) return { eyes: '– –', mouth: '·' }
-      const eye = ['◐', '◓', '◑', '◒'][f % 4]!
-      return { eyes: `${eye} ${eye}`, mouth: ['·', 'o', 'O', 'o'][f % 4]! }
+      switch (w.act) {
+        case 'read':
+          return { eyes: ['◖ ◖', '◖ ◖', '● ●', '◗ ◗', '◗ ◗', '● ●'][f % 6]!, mouth: '·' }
+        case 'edit':
+          return { eyes: '▪ ▪', mouth: (f >> 1) % 2 ? '›' : '‹' }
+        case 'bash':
+          return { eyes: '◉ ◉', mouth: (f >> 1) % 2 ? 'O' : 'o' }
+        case 'think':
+          return { eyes: '◔ ◔', mouth: f % 8 < 4 ? '·' : '~' }
+        default: {
+          const eye = ['◐', '◓', '◑', '◒'][f % 4]!
+          return { eyes: `${eye} ${eye}`, mouth: ['·', 'o', 'O', 'o'][f % 4]! }
+        }
+      }
+    }
+
+    // Beside the face: an agent-type badge on top, and a live status glyph under it.
+    const ACCESSORY: Record<string, string> = { explore: '⌕', review: '✎', dev: '⚒' }
+    const statusGlyph = (w: { state: string; act?: string; lastAt?: number; react?: { kind: keyof typeof REACT_MS; at: number } }, f: number) => {
+      if (w.state !== 'running') return { g: '', color: undefined as string | undefined }
+      const r = w.react && now - w.react.at < REACT_MS[w.react.kind] ? w.react.kind : undefined
+      if (r === 'error') return { g: '!', color: '#ff5555' }
+      if (r === 'write') return { g: '✓', color: '#50fa7b' }
+      if (w.lastAt && now - w.lastAt > IDLE_MS) return { g: 'z', color: undefined }
+      switch (w.act) {
+        case 'read': return { g: '≡', color: undefined }
+        case 'edit': return { g: (f >> 1) % 2 ? '▌' : '', color: undefined }
+        case 'bash': return { g: (f >> 1) % 2 ? '$' : '', color: undefined }
+        case 'think': return { g: ['·', '··', '···', '··'][(f >> 1) % 4]!, color: undefined }
+        default: return { g: '', color: undefined }
+      }
     }
 
     const bar = (w: { state: string }, f: number) => {
@@ -1105,13 +1315,22 @@ export const register: Register = on => {
 
     const Avatar = ({ w, f }: { w: (typeof list)[number]; f: number }) => {
       const sp = SPECIES[num(w.id) % SPECIES.length]!
-      const { eyes, mouth } = faceOf(w, f)
-      const color = w.state === 'failed' ? '#ff5555' : w.state === 'killed' ? '#6272a4' : sp.color
+      const { eyes, mouth, tint } = faceOf(w, f) as { eyes: string; mouth: string; tint?: string }
+      const color = tint ?? (w.state === 'failed' ? '#ff5555' : w.state === 'killed' ? '#6272a4' : sp.color)
+      const badge = ACCESSORY[w.agent ?? ''] ?? ''
+      const st = statusGlyph(w, f)
       return (
-        <Box flexDirection="column" width={5} flexShrink={0}>
-          {sp.rows(eyes, mouth).map(r => (
-            <Text color={color} bold={w.state === 'running'}>{r}</Text>
-          ))}
+        <Box flexDirection="row" flexShrink={0}>
+          <Box flexDirection="column" width={5} flexShrink={0}>
+            {sp.rows(eyes, mouth).map(r => (
+              <Text color={color} bold={w.state === 'running'}>{r}</Text>
+            ))}
+          </Box>
+          <Box flexDirection="column" width={3} flexShrink={0}>
+            <Text color={sp.color} dimColor={w.state !== 'running'}> {badge}</Text>
+            <Text color={st.color ?? sp.color}> {st.g}</Text>
+            <Text> </Text>
+          </Box>
         </Box>
       )
     }
@@ -1153,7 +1372,7 @@ export const register: Register = on => {
         .filter(Boolean)
         .join(' · ')
       return (
-        <Box borderStyle="round" borderColor={accent} paddingX={1} gap={2} flexDirection="row">
+        <Box borderStyle="round" borderColor={accent} paddingX={1} gap={1} flexDirection="row">
           <Avatar w={w} f={f} />
           <Box flexDirection="column" flexGrow={1}>
             <Box justifyContent="space-between">
@@ -1197,7 +1416,7 @@ export const register: Register = on => {
         ))}
         {sorted.length > shown.length && <Text dimColor>  +{sorted.length - shown.length} more (enlarge the pane)</Text>}
         <Text dimColor>{rule}</Text>
-        <Text bold>session total {money(ledger.cost)}<Text dimColor> · {ledger.spawned} worker{ledger.spawned === 1 ? '' : 's'} spawned · {kilo(ledger.tokens)} tok · high reasoning · {modelNow.split('/').slice(1).join('/') || modelNow}</Text></Text>
+        <Text bold>session total {money(ledger.cost)}<Text dimColor> · {ledger.spawned} worker{ledger.spawned === 1 ? '' : 's'} spawned · {kilo(ledger.tokens)} tok · {thinkingNow} reasoning · {modelNow.split('/').slice(1).join('/') || modelNow}</Text></Text>
       </Box>
     )
   })

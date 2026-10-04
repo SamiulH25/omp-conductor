@@ -1,3 +1,6 @@
+// What the worker is doing right now; drives the avatar's pose.
+export type Act = 'think' | 'read' | 'edit' | 'bash' | 'tool'
+
 export type WorkerView = {
   id: string
   title: string
@@ -17,6 +20,9 @@ export type WorkerView = {
   tpsAt?: number
   avgTps?: number
   spark?: number[]
+  act?: Act
+  lastAt?: number
+  react?: { kind: 'error' | 'write' | 'turn'; at: number }
 }
 
 declare module 'claude-code' {
