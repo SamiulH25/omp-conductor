@@ -27,6 +27,6 @@ export type WorkerView = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'omp-conductor': { workers: WorkerView[]; frame: number; demo: boolean; model: string; ledger: { cost: number; tokens: number; spawned: number } }
+    'omp-conductor': { workers: WorkerView[]; frame: number; demo: boolean; model: string; thinking: string; ledger: { cost: number; tokens: number; spawned: number } }
   }
 }

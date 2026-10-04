@@ -1,9 +1,17 @@
 {
   "name": "omp-conductor",
-  "version": "2.6.0",
-  "description": "Lets Claude run several omp (oh-my-pi) workers in parallel in isolated git worktrees, read compact digests of their work, and judge, steer, merge and clean up.",
-  "author": { "name": "bob2142" },
+  "version": "3.1.0",
+  "description": "Lets Claude run several Pi workers (long-lived pi --mode rpc processes) in parallel in isolated git worktrees, recall them for fixes, read compact digests of their work, and judge, steer, merge and clean up. Needs Pi installed and an OpenCode Go key.",
+  "author": {
+    "name": "bob2142"
+  },
   "license": "MIT",
-  "keywords": ["omp", "oh-my-pi", "orchestration", "workers", "subagents"],
+  "keywords": [
+    "pi",
+    "orchestration",
+    "workers",
+    "subagents",
+    "opencode-go"
+  ],
   "types": "./types/index.d.ts"
 }

@@ -10,22 +10,69 @@ const FINAL_CHARS = 700
 const FILE_LIMIT = 12
 const ROOTS_EXTRA = ['/tmp']
 const DENY = /\/\.(ssh|gnupg|aws|kube|docker)(\/|$)/
-// The only model workers ever use. /omp-model changes it and the choice is kept in the store.
+// Workers are Pi (https://pi.dev) RPC processes: one long-lived `pi --mode rpc` per worker, so a worker keeps
+// what it learned and can be recalled for fixes. They run in their own Pi agent dir (own prompt, models, sessions).
+// The only model workers ever use. /pi-model changes it and the choice is kept in the store.
 const SUMMARY_MODEL = 'haiku' // the one other model: compresses a long worker reply that has no SUMMARY block
 const DEFAULT_MODEL = 'opencode-go/deepseek-v4.1-flash'
-const DEFAULT_THINKING = 'high' // reasoning effort workers start with; /omp-effort changes it
-const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto'] // omp --thinking values
+const DEFAULT_THINKING = 'low' // reasoning effort workers start with; /pi-effort changes it
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] // pi --thinking values
+const AGENT_DIR_NAME = '.pi-workers' // under $HOME: PI_CODING_AGENT_DIR for every worker
+const KEY_VARS = ['OPENCODE_GO_API_KEY', 'OPENCODE_API_KEY'] // OpenCode Go key: env file in the agent dir, or the environment
+const SOFT_FRACTION = 0.85 // at this share of the time limit the worker is told to wrap up
+const GRACE_MS = 2 * 60 * 1000 // after the limit the worker gets this long to write its partial report before it is stopped
+const VERIFY_TAIL = 1500 // chars of a failing verify command's output kept for the digest and the fix prompt
+const JUNK = ['Library', 'Temp', 'obj', 'Logs', 'node_modules', '.git', '__pycache__', 'Builds'] // skipped when listing changes in a non-git dir
+const IDLE_STOP_MS = 30 * 60 * 1000 // an idle worker's Pi process is stopped after this; pi_send resumes its session
 const STORE_PREFIX = 'workers:' // one store key per Claude session, so sessions never share records
 // Avatar reactions: how long a one-shot reaction shows, and which tools count as reading or editing.
 const REACT_MS = { error: 1800, write: 1200, turn: 700 } as const
 const REACT_RANK = { error: 3, write: 2, turn: 1 } as const
-const READ_TOOLS = new Set(['read', 'grep', 'glob', 'find', 'search', 'ls', 'ast_grep'])
+const READ_TOOLS = new Set(['read', 'grep', 'find', 'ls'])
 const SYNC_MS = 250 // minimum gap between pane syncs triggered by worker output
 const STALE_MS = 14 * 24 * 3600 * 1000
 // Project dictionary: short term -> definition entries per project root, kept in the store, injected into every worker.
 const DICT_PREFIX = 'dict:'
 const DICT_MAX_CHARS = 6000 // whole dictionary; keeps the injected context small
 const DICT_DEF_CHARS = 300 // one definition; a dictionary entry, not an essay
+
+// First-run files for the worker agent dir, written only when missing so the user's edits stay.
+const WORKER_PROMPT = `You are a worker subagent. An orchestrator gave you one task in a project directory; do it and report back.
+
+Rules:
+- Read each file once. Do not re-read a file or re-run a command whose output you already have; use what is in context.
+- Prefer grep to locate code, then read only the part you need.
+- Make the smallest change that completes the task. Do not touch unrelated files, commit, or push.
+- Use tool calls only for work. Do not narrate or restate the task.
+- You may be recalled later in this same session for fixes. Keep what you learned about the codebase; do not re-explore it.
+- Finish with a short report: \`SUMMARY:\` then what changed or was found, with file:line references. State anything you could not verify.
+`
+const WORKER_SETTINGS = {
+  defaultProvider: 'opencode-go',
+  defaultModel: 'deepseek-v4.1-flash',
+  defaultThinkingLevel: DEFAULT_THINKING,
+  defaultTools: ['read', 'edit', 'write', 'bash', 'grep'],
+  quietStartup: true,
+}
+const WORKER_MODELS = {
+  providers: {
+    'opencode-go': {
+      baseUrl: 'https://opencode.ai/zen/go/v1',
+      api: 'openai-completions',
+      apiKey: '$OPENCODE_GO_API_KEY',
+      models: [
+        { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash (Go)', reasoning: true, input: ['text'], contextWindow: 1000000, maxTokens: 65536 },
+      ],
+    },
+  },
+}
+const SETUP_HELP = `omp-conductor workers run on Pi, and Pi is not ready:
+{problems}
+Set up (once):
+  1. Install Pi (needs Node 22.19+): npm install -g --ignore-scripts @earendil-works/pi-coding-agent   (or: curl -fsSL https://pi.dev/install.sh | sh)
+  2. Put your OpenCode Go key where the plugin can read it: echo 'OPENCODE_GO_API_KEY=<your key>' > ~/${AGENT_DIR_NAME}/env && chmod 600 ~/${AGENT_DIR_NAME}/env   (or export OPENCODE_GO_API_KEY in the environment Claude Code starts from)
+  3. Restart Claude Code, or just ask for a worker again: while Pi is not ready the check re-runs on every spawn, so no restart is needed.
+The plugin creates ~/${AGENT_DIR_NAME}/ (worker prompt, models, sessions) by itself; nothing else needs configuring.`
 
 // The worker simplifies its own work: every task ends with a SUMMARY block the digest quotes.
 const SUFFIX =
@@ -36,7 +83,7 @@ const SUMMARY_RE = /(?:^|\n)[#*\s]*SUMMARY:?[*\s]*\n?([\s\S]*)$/
 // 'summary' types condense their own work; 'detailed' types return the full report and are never compressed.
 type AgentType = {
   about: string
-  tools?: string[] // omp --tools allowlist; undefined = every tool
+  tools?: string[] // pi --tools allowlist; undefined = the agent dir's defaultTools
   worktree: boolean | 'auto' // default isolation ('auto' = a worktree when dir is a git repo)
   report: 'summary' | 'detailed'
   maxMinutes: number
@@ -44,7 +91,9 @@ type AgentType = {
   suffix: string // appended to the task: how to end the final reply
 }
 
-const READ_ONLY = ['read', 'grep', 'glob', 'find']
+const WORKER_RULES =
+  ' EDITING: make ONE edit per edit call (never batch several in one call); copy oldText exactly from a fresh read of that region; if an edit fails, re-read the region and retry that single edit. Never fall back to python/sed/heredoc rewrites of source files. TESTING: if the project\'s real test runner cannot be run from here (a locked editor, a missing tool), do NOT build a substitute harness or checker anywhere; make the change, check it by reading, and say plainly that it is unverified. Only run the check the task names. SCRATCH: put any scratch file in $TMPDIR, never in the project and never in /tmp directly. OTHERS: other workers may be editing other files in this project at the same time; compile errors in files you did not touch belong to them, so do not fix or work around them. Stay on the task: if you finish without changing the files you were asked to change, say so and why.'
+const READ_ONLY = ['read', 'grep', 'find', 'ls']
 const READ_ONLY_ROLE =
   'PERMISSIONS: read-only. You can read, search and list files; you cannot and must not modify, create or delete anything, run builds or change any state. Your tools are restricted accordingly; do not try to work around that. If the task needs a change, describe the change and where it belongs instead of making it.'
 const DETAILED_RULES =
@@ -56,16 +105,16 @@ const AGENTS: Record<string, AgentType> = {
     worktree: 'auto',
     report: 'summary',
     maxMinutes: 20,
-    role: '',
+    role: `You are a general worker.${WORKER_RULES}`,
     suffix: SUFFIX,
   },
   dev: {
     about: 'implements changes: read, edit, write, shell; short SUMMARY of what changed. Worktree by default',
-    tools: [...READ_ONLY, 'edit', 'write', 'bash', 'todo'],
+    tools: [...READ_ONLY, 'edit', 'write', 'bash'],
     worktree: 'auto',
     report: 'summary',
     maxMinutes: 20,
-    role: 'You are a dev agent. PERMISSIONS: you may read, edit and create files and run shell commands, only inside the working directory and only for what the task asks. Do not touch unrelated files, do not install global packages, do not run git commit, push, checkout or reset (the supervisor commits and merges), and do not delete anything outside the task. Verify your work with the tests or checks named in the task before you finish.',
+    role: 'You are a dev agent. PERMISSIONS: you may read, edit and create files and run shell commands, only inside the working directory and only for what the task asks. Do not touch unrelated files, do not install global packages, do not run git commit, push, checkout or reset (the supervisor commits and merges), and do not delete anything outside the task. Verify your work with the tests or checks named in the task before you finish.' + WORKER_RULES,
     suffix: SUFFIX,
   },
   explore: {
@@ -96,7 +145,7 @@ const frameAtom = atom({ plugin: 'omp-conductor', key: 'frame' } as const, 0)
 const demoAtom = atom({ plugin: 'omp-conductor', key: 'demo' } as const, false)
 // Everything the session has spent on workers, kept even after a worker is cleaned up.
 const modelAtom = atom({ plugin: 'omp-conductor', key: 'model' } as const, 'opencode-go/deepseek-v4.1-flash')
-const thinkingAtom = atom({ plugin: 'omp-conductor', key: 'thinking' } as const, 'high')
+const thinkingAtom = atom({ plugin: 'omp-conductor', key: 'thinking' } as const, 'low')
 const ledgerAtom = atom({ plugin: 'omp-conductor', key: 'ledger' } as const, { cost: 0, tokens: 0, spawned: 0 })
 
 type State = 'running' | 'done' | 'failed' | 'killed'
@@ -109,6 +158,7 @@ type Worker = {
   root: string // git toplevel, or dir outside git; keys the project dictionary
   isGit: boolean
   worktree?: string
+  sub?: string // dir's path inside the repo (e.g. /packages/api); the worker starts at the same place in its worktree
   branch?: string
   summary?: string
   session?: string
@@ -132,7 +182,31 @@ type Worker = {
   tokensOut: number
   stderr: string
   isReported: boolean
-  stop?: () => void
+  stop?: () => void // ends the worker's Pi process
+  send?: (cmd: Record<string, unknown>) => Promise<void> // writes one RPC command to it
+  timer?: { cancel: () => void } // the run's time limit
+  runError?: string // set when the run ended in a provider error or hit the time limit
+  killed?: boolean
+  firstAt?: number // first streamed delta of the turn, for the decode-speed fallback
+  live?: string // tail of what the model is thinking or writing right now; shown as the card's activity
+  soft?: { cancel: () => void } // 'wrap up' timer
+  grace?: { cancel: () => void } // hard stop after the limit, once the partial report had its chance
+  timedOut?: boolean
+  verify?: string // command the plugin runs itself after the worker finishes (serialized across workers)
+  verifyTimeout?: number
+  fixesLeft?: number // automatic fix rounds: a failing verify is sent back to the worker this many times
+  verifying?: boolean
+  verifyDone?: boolean
+  verifyResult?: { ok: boolean; exit: number; tail: string }
+  warn: string[] // things the supervisor must not miss: no changes made, expected files untouched, verify failed
+  expect?: string[] // paths (relative to dir) the task must change
+  effort?: string // per-worker reasoning effort override
+  effortSent?: string
+  marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
+  snapDir?: string // non-git dirs: originals of files the worker edited (written by the guard extension)
+  tokensCache: number
+  waitSteps?: number // pi_wait reports running workers as deltas against these
+  waitFiles?: number
   tps?: number
   tpsAt?: number
   outTokens: number
@@ -151,6 +225,10 @@ type Bridge = {
   sync: () => Promise<void>
   syncSoon: () => void
   launch: (w: Worker, message: string) => void
+  finished: (w: Worker) => Promise<void>
+  verify: (w: Worker) => Promise<void>
+  changed: (w: Worker) => Promise<string[] | undefined>
+  nonGitDiff: (w: Worker, cap: number) => Promise<string>
   summarize: (text: string) => Promise<string | undefined>
   git: (
     args: string[],
@@ -182,7 +260,7 @@ const demoList = (now: number): WorkerView[] => [
 
 const text = (s: string, isError = false) => (isError ? { deny: s } : { result: s })
 
-const money = (c: number) => `$${c >= 1 ? c.toFixed(2) : c >= 0.01 ? c.toFixed(3) : c.toFixed(4)}`
+const money = (c: number) => (c <= 0 ? 'plan' : `$${c >= 1 ? c.toFixed(2) : c >= 0.01 ? c.toFixed(3) : c.toFixed(4)}`)
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 const one = (s: string) => s.replace(/\s+/g, ' ').trim()
 const ownSummary = (w: Worker) => {
@@ -210,6 +288,11 @@ export const register: Register = on => {
   let demoOn = false
   let currentModel = DEFAULT_MODEL
   let currentThinking = DEFAULT_THINKING
+  let agentDir = ''
+  let apiKey = ''
+  let sid = ''
+  let ensureSetup: () => Promise<string | undefined> = async () => undefined
+  let setupProblems: string[] = ['setup not checked yet']
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
   let seq = 0
 
@@ -227,7 +310,7 @@ export const register: Register = on => {
       errors: w.errors.length,
       model: w.model?.split('/').at(-1),
       agent: w.agent === DEFAULT_AGENT ? undefined : w.agent,
-      note: firstBullet(ownSummary(w) ?? w.summary),
+      note: w.warn.length ? `⚠ ${clip(one(w.warn[0]!), 70)}` : firstBullet(ownSummary(w) ?? w.summary),
       err: w.errors.at(-1) ? clip(one(w.errors.at(-1)!), 80) : undefined,
       tps: (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps,
       tpsAt: w.state === 'running' && liveTps(w, Date.now()) ? Date.now() : w.tpsAt,
@@ -242,7 +325,35 @@ export const register: Register = on => {
 
   const sync = () => B?.sync() ?? Promise.resolve()
 
-  const workDir = (w: Worker) => w.worktree ?? w.dir
+  const workDir = (w: Worker) => (w.worktree ? `${w.worktree}${w.sub ?? ''}` : w.dir)
+
+  // A run is over (Pi settled, the process died, it was killed or hit its time limit). The process may stay up.
+  const finish = (w: Worker) => {
+    if (w.state !== 'running') return
+    w.timer?.cancel()
+    w.timer = undefined
+    w.soft?.cancel()
+    w.soft = undefined
+    w.grace?.cancel()
+    w.grace = undefined
+    if (w.timedOut && !w.killed && !w.runError) {
+      w.runError = `time limit (${w.maxMinutes ?? 20}m) reached; the worker was asked for a partial report (its last message)`
+      w.errors.push(w.runError)
+    }
+    const next = w.killed ? 'killed' : w.runError ? 'failed' : 'done'
+    // A verify command runs before the worker counts as done; a failure can go back to the worker as a fix round.
+    if (next === 'done' && w.verify && !w.verifyDone) {
+      if (w.verifying) return
+      w.verifying = true
+      w.act = 'bash'
+      w.last = `verifying: ${clip(one(w.verify), 60)}`
+      void B?.verify(w)
+      return
+    }
+    w.endedAt = Date.now()
+    w.state = next
+    void B?.finished(w)
+  }
 
   // ---------------------------------------------------------------- parsing
   const note = (w: Worker, line: string) => {
@@ -271,7 +382,7 @@ export const register: Register = on => {
   const WINDOW_MS = 2500
 
   // Live speed: characters streamed in the last couple of seconds, turned into tokens with a
-  // ratio the previous turns calibrated against omp's own usage numbers.
+  // ratio the previous turns calibrated against Pi's own usage numbers.
   const liveTps = (w: Worker, now: number) => {
     w.win = w.win.filter(([t]) => t >= now - WINDOW_MS)
     if (!w.win.length) return undefined
@@ -285,20 +396,27 @@ export const register: Register = on => {
     try {
       ev = JSON.parse(raw)
     } catch {
-      // omp prints plain-text errors (unknown model, bad flag) outside the JSON stream.
+      // Pi prints plain-text errors (unknown model, bad flag) outside the JSON stream.
       w.stderr = (w.stderr + raw + '\n').slice(-2000)
       note(w, `raw: ${raw}`)
       return
     }
     w.lastAt = Date.now()
     switch (ev.type) {
-      case 'session':
-        if (typeof ev.id === 'string') w.session = ev.id
+      case 'response':
+        // The reply to get_state (sent once after start) carries the id pi_send resumes with.
+        if (ev.command === 'get_state' && ev.success && typeof ev.data?.sessionId === 'string') w.session = ev.data.sessionId
+        else if (ev.success === false && ev.command !== 'get_state') {
+          w.runError = clip(one(String(ev.error ?? `${ev.command} failed`)), 200)
+          w.errors.push(`${ev.command}: ${w.runError}`)
+        }
         break
       case 'turn_start':
         w.turnChars = 0
+        w.firstAt = undefined
+        w.live = ''
         w.act = 'think'
-        if (w.last === 'starting') w.last = 'thinking'
+        w.last = 'thinking'
         break
       case 'message_update': {
         const a = ev.assistantMessageEvent ?? {}
@@ -307,7 +425,23 @@ export const register: Register = on => {
           (a.type === 'text_delta' || a.type === 'toolcall_delta' || a.type === 'thinking_delta')
         ) {
           w.turnChars += a.delta.length
+          w.firstAt ??= Date.now()
           w.win.push([Date.now(), a.delta.length])
+          // The card's activity follows the model: what it is thinking, what it is writing, which tool call it is composing.
+          if (a.type !== 'toolcall_delta') {
+            const kind = a.type === 'thinking_delta' ? 'thinking' : 'writing'
+            w.act = a.type === 'thinking_delta' ? 'think' : 'edit'
+            w.live = ((w.live ?? '') + a.delta).slice(-240)
+            const tail = one(w.live)
+            w.last = `${kind}: ${tail.length > 70 ? `…${tail.slice(-69)}` : tail}`
+          }
+        } else if (a.type === 'thinking_start' || a.type === 'text_start') {
+          w.live = ''
+          w.act = a.type === 'thinking_start' ? 'think' : 'edit'
+          w.last = a.type === 'thinking_start' ? 'thinking' : 'writing'
+        } else if (a.type === 'toolcall_start') {
+          w.act = 'tool'
+          w.last = `preparing ${String(a.toolName ?? 'tool call')}`
         } else if (a.type === 'text_end' && typeof a.content === 'string' && a.content) {
           w.texts.push(a.content)
           note(w, `text ${a.content}`)
@@ -358,12 +492,13 @@ export const register: Register = on => {
         const gen = Number(u.output ?? 0)
         w.steps += 1
         w.tokensIn += Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0)
+        w.tokensCache += Number(u.cacheRead ?? 0)
         w.tokensOut += gen
         const cost = Number(u.cost?.total ?? 0)
         w.cost += cost
         void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0)
         // Exact decode speed for the turn: generated tokens over time after the first token.
-        const decodeMs = Number(m.duration ?? 0) - Number(m.ttft ?? 0)
+        const decodeMs = m.duration != null ? Number(m.duration) - Number(m.ttft ?? 0) : w.firstAt ? Date.now() - w.firstAt : 0
         if (gen > 0 && decodeMs >= 150) {
           w.tps = gen / (decodeMs / 1000)
           w.tpsAt = Date.now()
@@ -377,8 +512,24 @@ export const register: Register = on => {
         react(w, 'turn')
         break
       }
+      case 'message_end': {
+        const m = ev.message ?? {}
+        if (m.role === 'assistant' && (m.stopReason === 'error' || m.stopReason === 'aborted')) {
+          const why = clip(one(String(m.errorMessage ?? m.stopReason)), 200)
+          if (m.stopReason === 'error' || (m.stopReason === 'aborted' && !w.killed && !w.runError)) {
+            w.runError = m.stopReason === 'aborted' ? 'aborted by Pi' : why
+            w.errors.push(`model: ${w.runError}`)
+            react(w, 'error')
+          }
+        }
+        break
+      }
       case 'agent_end':
         w.sawEnd = true
+        break
+      case 'agent_settled':
+        // Pi will do nothing more on its own: the run is over, the process stays up for the next prompt.
+        finish(w)
         break
       default:
         break
@@ -419,10 +570,15 @@ export const register: Register = on => {
     }
     if (w.state !== 'running' && w.stderr.trim()) lines.push(`stderr: ${clip(one(w.stderr), 300)}`)
     const avg = w.genMs > 0 ? `, ~${Math.round(w.outTokens / (w.genMs / 1000))} tok/s` : ''
-    lines.push(`steps ${w.steps}, tokens in/out ${w.tokensIn}/${w.tokensOut}${avg}, cost ${money(w.cost)}`)
+    lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
+    for (const x of w.warn) lines.push(`⚠ ${x}`)
+    if (w.verifyResult) lines.push(`verify ${w.verifyResult.ok ? 'PASSED' : `FAILED (exit ${w.verifyResult.exit})`}: ${w.verify}${w.verifyResult.ok ? '' : `\n${w.verifyResult.tail}`}`)
     const final = w.texts.at(-1)?.trim()
     const own = ownSummary(w)
-    if (kind.report === 'detailed' && final && w.state !== 'running') {
+    // Mid-run the last message is usually an opening line from many steps ago: show the live activity instead.
+    if (w.state === 'running') {
+      lines.push(`now: ${w.last} (no final message yet)`)
+    } else if (kind.report === 'detailed' && final && w.state !== 'running') {
       // Explore and review agents: the whole report, never compressed.
       const cap = full ? REPORT_CHARS_FULL : REPORT_CHARS
       lines.push(`report${final.length > cap ? ` (first ${cap} of ${final.length} chars; detail:"full" for more)` : ''}:`, clip(final, cap))
@@ -457,10 +613,52 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cwd = (e as { cwd?: string }).cwd ?? ''
     home = (await $.process.run(['printenv', 'HOME']).catch(() => undefined))?.stdout.trim() ?? ''
+    agentDir = `${home}/${AGENT_DIR_NAME}`
+    sid = String(await $.session.id())
+
+    // Pi must be installed and the OpenCode Go key present. Create the agent dir's files if missing, then check.
+    const checkSetup = async (): Promise<string[]> => {
+      const problems: string[] = []
+      const v = await $.process.run(['pi', '--version'], { timeoutMs: 15_000 }).catch(() => undefined)
+      if (!v || v.exitCode !== 0) problems.push('- `pi` is not installed or not on PATH (Claude Code must be started from a shell where `pi --version` works)')
+      for (const [name, body] of [
+        ['SYSTEM.md', WORKER_PROMPT],
+        ['settings.json', `${JSON.stringify(WORKER_SETTINGS, null, 2)}\n`],
+        ['models.json', `${JSON.stringify(WORKER_MODELS, null, 2)}\n`],
+      ] as const) {
+        const path = `${agentDir}/${name}`
+        if (!(await $.fs.exists(path).catch(() => false))) await $.fs.write(path, body).catch(() => undefined)
+      }
+      apiKey = ''
+      const envText = await $.fs.read(`${agentDir}/env`).catch(() => undefined)
+      for (const line of typeof envText === 'string' ? envText.split('\n') : []) {
+        const m = /^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line)
+        if (m && KEY_VARS.includes(m[1]!)) apiKey ||= m[2]!.replace(/^(['"])(.*)\1$/, '$2')
+      }
+      for (const k of KEY_VARS) {
+        if (apiKey) break
+        apiKey = (await $.process.run(['printenv', k]).catch(() => undefined))?.stdout.trim() ?? ''
+      }
+      if (!apiKey) problems.push(`- no OpenCode Go key found (looked in ~/${AGENT_DIR_NAME}/env and the environment for ${KEY_VARS.join(' or ')})`)
+      return problems
+    }
+    ensureSetup = async () => {
+      if (!setupProblems.length) return undefined
+      setupProblems = await checkSetup()
+      return setupProblems.length ? SETUP_HELP.replace('{problems}', setupProblems.join('\n')) : undefined
+    }
+    // Command files of workers whose session is long gone (a stop at shutdown can lose its rm).
+    void $.process.run(['find', `${agentDir}/run`, '(', '-name', '*.jsonl', '-o', '-name', '*.marker', ')', '-mmin', '+180', '-delete'], { timeoutMs: 10_000 }).catch(() => undefined)
+    void $.process.run(['find', `${agentDir}/tmp`, `${agentDir}/snap`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+2880', '-exec', 'rm', '-rf', '{}', '+'], { timeoutMs: 10_000 }).catch(() => undefined)
+    setupProblems = await checkSetup()
+    if (setupProblems.length) {
+      $.ui.toast('omp-conductor: Pi is not set up; workers cannot start. Ask Claude to pi_spawn for setup steps.')
+      $.ui.status('omp: Pi not set up')
+    }
 
     // Everything that needs `$` for the session's life is built here, where it is in scope.
-    let wakeTimer: (() => void) | undefined
-    let syncTimer: (() => void) | undefined
+    let wakeTimer: { cancel: () => void } | undefined
+    let syncTimer: { cancel: () => void } | undefined
     const pendingWake = new Set<string>()
 
     currentModel = String((await $.store.get('model').catch(() => undefined)) || DEFAULT_MODEL)
@@ -469,6 +667,7 @@ export const register: Register = on => {
     currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
     await update($, thinkingAtom, () => currentThinking)
     let lastSig = ''
+    let verifyChain: Promise<unknown> = Promise.resolve() // verify commands run one at a time (a locked editor cannot run two)
     const storeKey = `${STORE_PREFIX}${await $.session.id()}`
     const record = (w: Worker) => ({
       id: w.id,
@@ -478,6 +677,15 @@ export const register: Register = on => {
       root: w.root,
       isGit: w.isGit,
       worktree: w.worktree,
+      sub: w.sub,
+      warn: w.warn,
+      expect: w.expect,
+      effort: w.effort,
+      marker: w.marker,
+      snapDir: w.snapDir,
+      tokensCache: w.tokensCache,
+      verify: w.verify,
+      verifyResult: w.verifyResult,
       branch: w.branch,
       session: w.session,
       model: w.model,
@@ -502,7 +710,7 @@ export const register: Register = on => {
       cost: w.cost,
     })
 
-    // Bring back what an earlier load knew, so a reload keeps ids and sessions (omp_send still works).
+    // Bring back what an earlier load knew, so a reload keeps ids and sessions (pi_send still works).
     const saved = (await $.store.get(storeKey).catch(() => undefined)) as
       | { at: number; workers: ReturnType<typeof record>[] }
       | undefined
@@ -526,6 +734,8 @@ export const register: Register = on => {
           genMs: r.genMs ?? 0,
           spark: r.spark ?? [],
           cost: r.cost ?? 0,
+          warn: r.warn ?? [],
+          tokensCache: r.tokensCache ?? 0,
           sawEnd: true,
           turnChars: 0,
           ratio: 0.28,
@@ -602,7 +812,7 @@ export const register: Register = on => {
         $.ui.status(
           all.length === 0 && !led.spawned
             ? undefined
-            : `omp ${n('running')} running · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
+            : `pi ${n('running')} running · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
         )
       },
 
@@ -627,7 +837,7 @@ export const register: Register = on => {
       // worker was already reviewed. Hold it while a turn runs and re-check at the turn's end.
       wake: id => {
         pendingWake.add(id)
-        wakeTimer?.()
+        wakeTimer?.cancel()
         wakeTimer = $.clock.after(2000, () => {
           if (!turnActive) B?.flush()
         })
@@ -637,12 +847,14 @@ export const register: Register = on => {
         const ids = [...pendingWake].filter(i => workers.get(i)?.isReported === false)
         pendingWake.clear()
         if (!ids.length) return
-        const brief = ids.map(i => `${i} (${workers.get(i)!.state})`).join(', ')
+        const brief = ids.map(i => { const x = workers.get(i)!; return `${i} (${x.state}${x.warn.length ? ` ⚠ ${x.warn.join('; ')}` : ''})` }).join(', ')
         void $.prompt.submit({
-          text: `omp-conductor: worker(s) finished: ${brief}. Review with omp_digest / omp_diff, then omp_merge, omp_send a correction, or re-spawn.`,
+          text: `omp-conductor: worker(s) finished: ${brief}. Review with pi_digest / pi_diff, then pi_merge, pi_send a correction, or re-spawn.`,
         })
       },
 
+      // A run is one prompt sent to the worker's Pi process. The process is started on the first prompt and
+      // stays up, so a follow-up (pi_send) goes to a worker that still holds everything it learned.
       launch: (w, message) => {
         if (w.session) w.startedAt = Date.now()
         w.state = 'running'
@@ -650,67 +862,228 @@ export const register: Register = on => {
         w.stderr = ''
         w.isReported = false
         w.sawEnd = false
+        w.killed = false
+        w.timedOut = false
+        w.verifying = false
+        w.verifyDone = false
+        w.runError = undefined
+        w.warn = []
         w.win = []
+        w.live = ''
+        w.act = 'think'
+        w.last = w.steps > 0 ? `follow-up: ${clip(one(message), 60)}` : 'starting'
         void (async () => {
-          const argv = [
-            'omp', '-p', '--mode', 'json', '--cwd', workDir(w),
-            '--approval-mode', 'yolo', '--no-title', '--max-time', `${w.maxMinutes ?? 20}m`,
-          ]
-          w.model = currentModel
-          argv.push('--model', currentModel)
-          argv.push('--thinking', currentThinking)
           const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
-          if (kind.tools) argv.push('--tools', kind.tools.join(','))
-          const dict = await dictText(w.root)
-          const sys = [kind.role, dict].filter(Boolean).join('\n\n')
-          if (sys) argv.push('--append-system-prompt', sys)
-          if (w.session) argv.push('--resume', w.session)
+          if (!w.send && !(await startProc(w))) return
+          if (w.effort && w.effortSent !== w.effort) {
+            w.effortSent = w.effort
+            await w.send?.({ type: 'set_thinking_level', level: w.effort })
+          }
+          // Time limit: a wrap-up nudge at 85%, then at 100% a request for a partial report with a grace period,
+          // and only then a hard stop. Nearly finished work is never killed silently.
+          const mins = w.maxMinutes ?? 20
+          w.timer?.cancel()
+          w.soft?.cancel()
+          w.grace?.cancel()
+          w.soft = $.clock.after(mins * 60_000 * SOFT_FRACTION, () => {
+            if (w.state !== 'running' || w.verifying) return
+            const left = Math.max(1, Math.round(mins * (1 - SOFT_FRACTION)))
+            void w.send?.({ type: 'steer', message: `Time check: about ${left} minute(s) of your time limit remain. Finish the core change now, then stop and report what is done and what is not.` })
+          })
+          w.timer = $.clock.after(mins * 60_000, () => {
+            if (w.state !== 'running' || w.verifying) return
+            w.timedOut = true
+            void w.send?.({ type: 'steer', message: 'TIME LIMIT REACHED. Stop now and reply with your report: what is done and verified, what is not done, and the exact files you changed.' })
+            w.grace = $.clock.after(GRACE_MS, () => {
+              if (w.state !== 'running') return
+              w.runError = `time limit (${mins}m) hit; no report within ${Math.round(GRACE_MS / 60_000)}m`
+              w.errors.push(w.runError)
+              w.stop?.()
+            })
+          })
           const body = message + kind.suffix
-          argv.push(body.startsWith('-') ? `Task: ${body}` : body)
-          let killed = false
-          const it = $.process.spawn({ argv, cwd: workDir(w) })[Symbol.asyncIterator]()
-          w.stop = () => {
-            killed = true
-            void it.return?.(undefined as never)
-          }
-          let buf = ''
-          let code: number | null = null
-          try {
-            for (;;) {
-              const step = await it.next()
-              if (step.done) {
-                code = step.value?.code ?? null
-                break
-              }
-              const { stream: pipe, text: chunk } = step.value
-              if (pipe === 'stderr') {
-                w.stderr = (w.stderr + chunk).slice(-2000)
-                continue
-              }
-              buf += chunk
-              let nl = buf.indexOf('\n')
-              while (nl >= 0) {
-                const line = buf.slice(0, nl).trim()
-                buf = buf.slice(nl + 1)
-                if (line) ingest(w, line)
-                nl = buf.indexOf('\n')
-              }
-              B?.syncSoon()
-            }
-            if (buf.trim()) ingest(w, buf.trim())
-          } catch (err) {
-            w.errors.push(`spawn: ${String((err as Error)?.message ?? err)}`)
-            code = -1
-          }
-          w.endedAt = Date.now()
-          w.stop = undefined
-          w.state = killed ? 'killed' : code === 0 && w.sawEnd ? 'done' : 'failed'
-          if (w.state === 'failed') w.errors.push(`omp exited ${code}${w.sawEnd ? '' : ' before finishing'}`)
-          await sync()
-          $.ui.toast(`omp ${w.id} ${w.state}: ${w.title}`)
-          if (!killed) B?.wake(w.id)
+          await w.send?.({ type: 'prompt', message: body.startsWith('/') ? `Task: ${body}` : body })
         })()
       },
+
+      changed: async w => {
+        if (w.worktree) {
+          const st = await B?.git(['status', '--porcelain', '--untracked-files=all'], workDir(w))
+          if (!st || st.exitCode !== 0) return undefined
+          return st.stdout.split('\n').filter(l => l.trim() && !/__pycache__|\.pyc$/.test(l)).map(l => l.slice(3).trim())
+        }
+        if (!w.marker) return undefined
+        const prune = JUNK.flatMap((n, i) => (i ? ['-o', '-name', n] : ['-name', n]))
+        const r = await $.process
+          .run(['find', workDir(w), '(', ...prune, ')', '-prune', '-o', '-type', 'f', '-newer', w.marker, '-print'], { timeoutMs: 30_000 })
+          .catch(() => undefined)
+        if (!r) return undefined
+        const base = `${workDir(w)}/`
+        return r.stdout.split('\n').filter(Boolean).filter(f => !/__pycache__|\.pyc$|\.meta$/.test(f)).slice(0, 200).map(f => (f.startsWith(base) ? f.slice(base.length) : f))
+      },
+
+      // Review path for dirs with no worktree: the guard extension saved each file's original before the first
+      // edit/write; this diffs them against now, and lists everything else that changed since the spawn.
+      nonGitDiff: async (w, cap) => {
+        const parts: string[] = []
+        const seen = new Set<string>()
+        const manifest = w.snapDir ? await $.fs.read(`${w.snapDir}/manifest.jsonl`).catch(() => undefined) : undefined
+        for (const line of typeof manifest === 'string' ? manifest.split('\n').filter(Boolean) : []) {
+          let m: { path: string; orig: string }
+          try {
+            m = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (m.path.startsWith(`${agentDir}/tmp/`)) continue // the worker's own scratch space, not part of the work
+          const rel = m.path.startsWith(`${workDir(w)}/`) ? m.path.slice(workDir(w).length + 1) : m.path
+          seen.add(rel)
+          if (!m.orig) {
+            parts.push(`--- new file: ${rel}`)
+            continue
+          }
+          const d = await $.process.run(['diff', '-u', '--label', `a/${rel}`, '--label', `b/${rel}`, m.orig, m.path], { timeoutMs: 20_000 }).catch(() => undefined)
+          if (d && d.stdout.trim()) parts.push(d.stdout.trimEnd())
+        }
+        const others = ((await B?.changed(w)) ?? []).filter(f => !seen.has(f))
+        const head = `${seen.size} file(s) edited with edit/write (new files are listed, existing ones diffed against the original)${others.length ? `; ${others.length} more changed by other means (shell), no baseline: ${others.slice(0, 20).join(', ')}${others.length > 20 ? ', …' : ''}` : ''}`
+        return clip([head, ...parts].join('\n\n'), cap)
+      },
+
+      verify: async w => {
+        const run = verifyChain.then(async () => {
+          if (w.state !== 'running' || !w.verify) return undefined
+          w.last = `verifying: ${clip(one(w.verify), 60)}`
+          return $.process.run(['bash', '-c', w.verify], { cwd: workDir(w), timeoutMs: Math.min(600, w.verifyTimeout ?? 300) * 1000 }).catch(() => null)
+        })
+        verifyChain = run.then(() => undefined, () => undefined)
+        const r = await run
+        w.verifying = false
+        if (w.state !== 'running') return
+        const ok = r?.exitCode === 0
+        const tail = r ? clip(`${r.stdout}\n${r.stderr}`.trim().slice(-VERIFY_TAIL * 2), VERIFY_TAIL).replace(/^…/, '…') : 'the verify command timed out or could not start'
+        w.verifyResult = { ok, exit: r?.exitCode ?? -1, tail }
+        if (!ok && (w.fixesLeft ?? 0) > 0) {
+          w.fixesLeft = (w.fixesLeft ?? 0) - 1
+          B?.launch(w, `The supervisor ran the verification (${w.verify}) after your work and it FAILED (exit ${r?.exitCode ?? 'n/a'}). Output tail:\n${tail}\n\nFix the cause in the code. Do not weaken or bypass the check. Then stop and report.`)
+          return
+        }
+        w.verifyDone = true
+        if (!ok) w.warn.push(`verify FAILED (exit ${r?.exitCode ?? 'n/a'}): ${clip(one(tail), 160)}`)
+        finish(w)
+      },
+
+      finished: async w => {
+        const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+        if (w.state !== 'killed' && (!kind.tools || kind.tools.includes('edit'))) {
+          const changed = await B?.changed(w)
+          if (changed) {
+            if (w.state === 'done' && changed.length === 0) w.warn.push('NO FILES CHANGED: the worker finished without modifying anything')
+            for (const x of w.expect ?? []) {
+              if (!changed.some(c => c === x || c.endsWith(`/${x}`))) w.warn.push(`expected change missing: ${x}`)
+            }
+          }
+        }
+        await sync()
+        $.ui.toast(`worker ${w.id} ${w.state}${w.warn.length ? ' ⚠' : ''}: ${w.title}`)
+        if (!w.killed) B?.wake(w.id)
+      },
+    }
+
+    const tmpDir = (w: Worker) => `${agentDir}/tmp/${sid}-${w.id}`
+    const childEnv = (w: Worker): Record<string, string> => ({
+      PI_CODING_AGENT_DIR: agentDir,
+      OPENCODE_GO_API_KEY: apiKey,
+      PYTHONDONTWRITEBYTECODE: '1',
+      TMPDIR: tmpDir(w), // scratch files stay out of the project and out of /tmp
+      ...(w.snapDir ? { PI_SNAPSHOT_DIR: w.snapDir } : {}),
+      ...(w.worktree ? { PI_MAIN_ROOT: w.root, PI_WORK_ROOT: w.worktree } : {}), // the guard keeps the worker inside its worktree
+    })
+    const cmdFile = (w: Worker) => `${agentDir}/run/${sid}-${w.id}.jsonl`
+
+    // Starts the worker's `pi --mode rpc`. Pi reads commands from stdin and the plugin API can only give a child a fixed
+    // input, so stdin is `tail -f` on a command file; --pid ends the tail (closing Pi's stdin, Pi's own shutdown) when
+    // the wrapper is killed. Commands are appended to that file by w.send.
+    const startProc = async (w: Worker): Promise<boolean> => {
+      const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+      const file = cmdFile(w)
+      await $.fs.write(file, '').catch(() => undefined)
+      await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
+      w.model = currentModel
+      const args = [
+        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', currentModel, '--thinking', w.effort ?? currentThinking,
+        '--offline', '-ne', '-ns', '-np', '-nc', '-na',
+      ]
+      args.push('-e', `${$.plugin.root}/extensions/guard.ts`)
+      if (kind.tools) args.push('--tools', kind.tools.join(','))
+      const dict = await dictText(w.root)
+      const jail = w.worktree ? `WORKTREE: your working directory is a private git worktree of ${w.root}. Use relative paths only. Never read or write under ${w.root} itself, even if the task text names it: that is the main checkout and other workers' merge target. Treat any such path in the task as the same path inside your working directory.` : ''
+      const sys = [kind.role, jail, dict].filter(Boolean).join('\n\n')
+      if (sys) args.push('--append-system-prompt', sys)
+      if (w.session) args.push('--session', w.session)
+      w.effortSent = w.effort ?? currentThinking
+      const it = $.process
+        .spawn({ argv: ['bash', '-c', 'tail -n +1 -f --pid=$$ "$0" 2>/dev/null | pi "$@"', file, ...args], cwd: workDir(w), env: childEnv(w) })
+        [Symbol.asyncIterator]()
+      let stopped = false
+      w.send = async cmd => {
+        await $.process
+          .run(['bash', '-c', 'printf "%s\\n" "$1" >> "$0"', file, JSON.stringify(cmd)], { timeoutMs: 10_000 })
+          .catch(() => undefined)
+      }
+      w.stop = () => {
+        stopped = true
+        w.send = undefined
+        w.stop = undefined
+        void it.return?.(undefined as never)
+        if (w.state === 'running') {
+          if (!w.runError) w.killed = true
+          finish(w)
+        }
+        void $.process.run(['rm', '-f', file], { timeoutMs: 5000 }).catch(() => undefined)
+      }
+      void (async () => {
+        let buf = ''
+        let code: number | null = null
+        try {
+          for (;;) {
+            const step = await it.next()
+            if (step.done) {
+              code = step.value?.code ?? null
+              break
+            }
+            const { stream: pipe, text: chunk } = step.value
+            if (pipe === 'stderr') {
+              w.stderr = (w.stderr + chunk).slice(-2000)
+              continue
+            }
+            buf += chunk
+            let nl = buf.indexOf('\n')
+            while (nl >= 0) {
+              const line = buf.slice(0, nl).trim()
+              buf = buf.slice(nl + 1)
+              if (line) ingest(w, line)
+              nl = buf.indexOf('\n')
+            }
+            B?.syncSoon()
+          }
+          if (buf.trim()) ingest(w, buf.trim())
+        } catch (err) {
+          w.errors.push(`spawn: ${String((err as Error)?.message ?? err)}`)
+        }
+        // The process ended on its own (crash, bad flag, auth failure): a run in flight failed with it.
+        if (!stopped) {
+          w.send = undefined
+          w.stop = undefined
+          if (w.state === 'running') {
+            w.runError ??= `pi exited${code != null ? ` ${code}` : ''} before the run finished${w.stderr.trim() ? `: ${clip(one(w.stderr), 160)}` : ''}`
+            w.errors.push(w.runError)
+            finish(w)
+          }
+        }
+      })()
+      await w.send({ type: 'get_state' })
+      return true
     }
 
     const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
@@ -718,12 +1091,12 @@ export const register: Register = on => {
       properties,
       required,
     })
-    const idProp = { id: { type: 'string', description: 'Worker id from omp_spawn' } }
+    const idProp = { id: { type: 'string', description: 'Worker id from pi_spawn' } }
 
     await $.tool.register({
-      name: 'omp_spawn',
+      name: 'pi_spawn',
       description:
-        'Start an omp worker in the background on a self-contained task and return its id at once. Workers always use the model the user set with /omp-model (not selectable here). Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use omp_wait / omp_digest to read compact results and judge them.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers always use the model the user set with /pi-model (not selectable here). Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
@@ -734,7 +1107,13 @@ export const register: Register = on => {
             enum: Object.keys(AGENTS),
             description: `Agent type (default ${DEFAULT_AGENT}). ${Object.entries(AGENTS).map(([k, a]) => `${k}: ${a.about}`).join('; ')}`,
           },
-          maxMinutes: { type: 'number', description: 'hard time limit for the run (default depends on agent type, 15-20)' },
+          maxMinutes: { type: 'number', description: 'time limit for the run (default depends on agent type, 15-20). At 85% the worker is told to wrap up; at 100% it is asked for a partial report and gets 2 more minutes before it is stopped. pi_send can resume it.' },
+          verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Use it for the real test runner the worker cannot run (e.g. a locked editor). The result goes in the digest; a failure counts as a warning.' },
+          verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
+          fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
+          expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
+          effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
+          noDict: { type: 'boolean', description: 'Skip the project-dictionary requirement for a dev/general worker (the first one in a project is refused until pi_dict has entries).' },
           worktree: {
             type: 'boolean',
             description: 'Isolate in a new git worktree (default depends on agent type; dev and general: true when dir is a git repo, explore and review: false)',
@@ -744,9 +1123,9 @@ export const register: Register = on => {
       ),
     })
     await $.tool.register({
-      name: 'omp_dict',
+      name: 'pi_dict',
       description:
-        'The project dictionary: short term -> definition entries (what a system is called, what it does, where it lives, conventions, how to run tests) that are injected into every worker for that project. Seed it from what you already understand BEFORE the first omp_spawn; after reviewing a worker, add facts you verified (never unverified worker claims). Not for task notes or history. action: show | set (upsert entries) | remove (terms).',
+        'The project dictionary: short term -> definition entries (what a system is called, what it does, where it lives, conventions, how to run tests) that are injected into every worker for that project. Seed it from what you already understand BEFORE the first pi_spawn; after reviewing a worker, add facts you verified (never unverified worker claims). Not for task notes or history. action: show | set (upsert entries) | remove (terms).',
       inputSchema: obj(
         {
           action: { type: 'string', enum: ['show', 'set', 'remove'] },
@@ -762,21 +1141,21 @@ export const register: Register = on => {
       ),
     })
     await $.tool.register({
-      name: 'omp_status',
-      description: 'One line per omp worker: state, elapsed, last action, files touched.',
+      name: 'pi_status',
+      description: 'One line per worker: state, elapsed, last action, files touched.',
       inputSchema: obj({}),
     })
     await $.tool.register({
-      name: 'omp_digest',
+      name: 'pi_digest',
       description:
-        'Compact report of one worker: files changed, commands, errors, final message, git status. detail "full" adds recent raw events. Treat claims as unverified; check with omp_diff.',
+        'Compact report of one worker: files changed, commands, errors, final message, git status. detail "full" adds recent raw events. Treat claims as unverified; check with pi_diff.',
       inputSchema: obj(
         { ...idProp, detail: { type: 'string', enum: ['brief', 'full'] } },
         ['id'],
       ),
     })
     await $.tool.register({
-      name: 'omp_wait',
+      name: 'pi_wait',
       description:
         'Wait until the given workers (default: all running) finish or timeoutSec passes (max 90 per call; call again to keep waiting), then return their digests.',
       inputSchema: obj({
@@ -786,44 +1165,53 @@ export const register: Register = on => {
       }),
     })
     await $.tool.register({
-      name: 'omp_send',
+      name: 'pi_send',
       description:
-        'Send a follow-up message to a worker in its same omp session (the worker must not be running).',
+        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes instead of re-spawning. The worker must not be running.',
       inputSchema: obj(
-        { ...idProp, message: { type: 'string' } },
+        {
+          ...idProp,
+          message: { type: 'string' },
+          maxMinutes: { type: 'number', description: 'New time limit for this run (use it to give a worker that hit its limit more time).' },
+          effort: { type: 'string', enum: THINKING_LEVELS, description: 'Change this worker\'s reasoning effort from this message on.' },
+        },
         ['id', 'message'],
       ),
     })
     await $.tool.register({
-      name: 'omp_diff',
+      name: 'pi_diff',
       description: 'git diff (with stat) of a worker\'s directory so you can review the real changes.',
       inputSchema: obj({ ...idProp, maxChars: { type: 'number' } }, ['id']),
     })
     await $.tool.register({
-      name: 'omp_kill',
-      description: 'Abort a running worker.',
+      name: 'pi_kill',
+      description: 'Abort a running worker and stop its Pi process.',
       inputSchema: obj(idProp, ['id']),
     })
 
     await $.tool.register({
-      name: 'omp_merge',
+      name: 'pi_merge',
       description:
         "Commit a finished worker's worktree changes and merge its branch (--no-ff) into the repo it was spawned from. Refuses while the worker runs or the main tree has tracked changes; aborts and reports on conflict.",
       inputSchema: obj({ ...idProp, message: { type: 'string', description: 'Merge commit message' } }, ['id']),
     })
     await $.tool.register({
-      name: 'omp_cleanup',
+      name: 'pi_cleanup',
       description:
         "Remove a finished worker's worktree and branch and forget the worker. Refuses if it has unmerged work unless force is true.",
       inputSchema: obj({ ...idProp, force: { type: 'boolean' } }, ['id']),
     })
 
     await $.command.register({ name: 'conductor', description: 'Show the omp-conductor workers pane' })
-    await $.command.register({ name: 'omp-model', description: 'Show or change the model every omp worker uses' })
-    await $.command.register({ name: 'omp-effort', description: 'Show or change the reasoning effort every omp worker uses' })
+    await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
+    await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
 
     $.clock.every(1000, () => {
       if (running() > 0) void sync()
+      // An idle worker's process is stopped after a while; pi_send resumes its saved session.
+      for (const w of workers.values()) {
+        if (w.stop && w.state !== 'running' && w.endedAt && Date.now() - w.endedAt > IDLE_STOP_MS) w.stop()
+      }
     })
     // The pane's animation clock: one tick per frame, only while a worker runs.
     $.clock.every(200, () => {
@@ -845,12 +1233,11 @@ export const register: Register = on => {
   })
 
   on('session.end', async (_$, e, next) => {
-    const live = [...workers.values()].filter(w => w.state === 'running')
-    for (const w of live) w.stop?.()
+    for (const w of workers.values()) w.stop?.()
     return next(e)
   })
 
-  on('command.run', { command: 'omp-model' }, async ($, e) => {
+  on('command.run', { command: 'pi-model' }, async ($, e) => {
     const arg = String((e as { args?: string }).args ?? '').trim()
     const set = async (m: string) => {
       currentModel = m
@@ -859,39 +1246,45 @@ export const register: Register = on => {
     }
     const status = `worker model: ${currentModel}${currentModel === DEFAULT_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_MODEL})`}`
     if (!arg) {
-      return { text: `${status}\nChange it: /omp-model <provider/model or part of a name>. Reset: /omp-model reset. List: omp models.` }
+      return { text: `${status}\nChange it: /pi-model <provider/model or part of a name>. Reset: /pi-model reset. List: pi --list-models. Models other than the bundled one must exist in ~/${AGENT_DIR_NAME}/models.json or Pi's catalog.` }
     }
     if (arg === 'reset' || arg === 'default') {
       await set(DEFAULT_MODEL)
       return { text: `worker model reset to ${DEFAULT_MODEL}. Applies to workers started or resumed from now on.` }
     }
+    const notReady = await ensureSetup()
+    if (notReady) return { text: notReady }
     const query = arg.includes('/') ? arg.split('/').slice(1).join('/') : arg
-    const r = await $.process.run(['omp', 'models', 'find', query, '--json'], { timeoutMs: 30_000 }).catch(() => undefined)
-    let models: { selector: string; kind?: string; thinking?: string[]; cost?: { input: number; output: number } }[] = []
-    try {
-      models = (JSON.parse(r?.stdout ?? '{}').models ?? []).filter((m: { kind?: string }) => !m.kind || m.kind === 'chat')
-    } catch {
-      return { text: `could not read the model list from omp (is it installed and logged in?). ${status}` }
-    }
+    // `pi --list-models <query>` prints a table: provider, model, context, ...
+    const listed = await $.process
+      .run(['pi', '--list-models', query], { env: { PI_CODING_AGENT_DIR: agentDir, OPENCODE_GO_API_KEY: apiKey }, timeoutMs: 30_000 })
+      .catch(() => undefined)
+    const models =
+      listed && listed.exitCode === 0
+        ? listed.stdout
+            .split('\n')
+            .map(l => l.trim().split(/\s+/))
+            .filter(c => c.length >= 2 && c[0] !== 'provider')
+            .map(c => ({ selector: `${c[0]}/${c[1]}`, context: c[2] }))
+        : undefined
+    if (!models) return { text: `could not read the model list from pi. ${status}` }
     const exact = models.filter(m => m.selector === arg)
     const hits = exact.length ? exact : models.filter(m => m.selector.includes(arg) || !arg.includes('/'))
-    if (!hits.length) return { text: `no omp model matches "${arg}". ${status}` }
+    if (!hits.length) return { text: `no pi model matches "${arg}". ${status}` }
     if (hits.length > 1) {
       const list = hits.slice(0, 10).map(m => `  ${m.selector}`).join('\n')
       return { text: `${hits.length} models match "${arg}"; pass the exact selector:\n${list}${hits.length > 10 ? '\n  …' : ''}\n${status}` }
     }
     const m = hits[0]!
     await set(m.selector)
-    const note = m.thinking?.length && !m.thinking.includes(currentThinking) ? ` Warning: it lists thinking levels ${m.thinking.join(', ')} but workers ask for "${currentThinking}"; change it with /omp-effort.` : ''
-    const price = m.cost ? ` ($${m.cost.input}/M in, $${m.cost.output}/M out)` : ''
-    return { text: `worker model set to ${m.selector}${price}. Applies to workers started or resumed from now on; running workers keep theirs.${note}` }
+    return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
   })
 
-  on('command.run', { command: 'omp-effort' }, async ($, e) => {
+  on('command.run', { command: 'pi-effort' }, async ($, e) => {
     const arg = String((e as { args?: string }).args ?? '').trim().toLowerCase()
     const status = `worker effort: ${currentThinking}${currentThinking === DEFAULT_THINKING ? ' (plugin default)' : ` (plugin default is ${DEFAULT_THINKING})`}`
     if (!arg) {
-      return { text: `${status}\nChange it: /omp-effort <${THINKING_LEVELS.join('|')}>. Reset: /omp-effort reset.` }
+      return { text: `${status}\nChange it: /pi-effort <${THINKING_LEVELS.join('|')}>. Reset: /pi-effort reset.` }
     }
     const level = arg === 'reset' || arg === 'default' ? DEFAULT_THINKING : arg
     if (!THINKING_LEVELS.includes(level)) {
@@ -900,19 +1293,11 @@ export const register: Register = on => {
     currentThinking = level
     await $.store.set('thinking', level).catch(() => undefined)
     await update($, thinkingAtom, () => level)
-    const r = await $.process.run(['omp', 'models', 'find', currentModel.split('/').slice(1).join('/') || currentModel, '--json'], { timeoutMs: 30_000 }).catch(() => undefined)
-    let listed: string[] | null | undefined
-    try {
-      listed = (JSON.parse(r?.stdout ?? '{}').models ?? []).find((m: { selector: string }) => m.selector === currentModel)?.thinking
-    } catch {
-      listed = undefined
-    }
-    const note = listed?.length && !listed.includes(level) && level !== 'off' && level !== 'auto' ? ` Warning: ${currentModel} lists thinking levels ${listed.join(', ')}; omp may clamp "${level}".` : ''
-    return { text: `worker effort set to ${level}. Applies to workers started or resumed from now on; running workers keep theirs.${note}` }
+    return { text: `worker effort set to ${level}. Applies to workers started from now on (a live worker process keeps the level it started with); Pi clamps it to what the model supports.` }
   })
 
   on('command.run', { command: 'conductor' }, async ($, e) => {
-    await $.ui.open({ id: PANE, title: 'omp workers' })
+    await $.ui.open({ id: PANE, title: 'workers' })
     const arg = String((e as { args?: string }).args ?? '').trim()
     if (arg === 'demo') {
       demoOn = !demoOn
@@ -923,7 +1308,9 @@ export const register: Register = on => {
     return { text: `${workers.size} worker(s), ${running()} running.` }
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_spawn' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_spawn' }, async ($, e) => {
+    const notReady = await ensureSetup()
+    if (notReady) return text(notReady, true)
     const task = String(e.task ?? '').trim()
     if (!task) return text('task is required', true)
     if (running() >= MAX_WORKERS) {
@@ -932,6 +1319,7 @@ export const register: Register = on => {
     const agent = String(e.agent ?? DEFAULT_AGENT)
     const kind = AGENTS[agent]
     if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
+    if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
     const dir = String(e.dir ?? cwd)
     if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
     if (!(await insideRoots(dir))) {
@@ -943,8 +1331,17 @@ export const register: Register = on => {
       .run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: 10_000 })
       .catch(() => undefined)
     const isGit = top?.exitCode === 0
+    // Without a dictionary every dev worker re-discovers the same layout (and the same traps). Make the supervisor seed one.
+    if (kind.tools?.includes('edit') !== false && e.noDict !== true) {
+      const have = Object.keys(((await $.store.get(DICT_PREFIX + (isGit ? top!.stdout.trim() : dir)).catch(() => undefined)) as object | undefined) ?? {}).length
+      if (!have) {
+        seq -= 1
+        return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, how to build and test, what the workers must NOT do or cannot run (for example a locked editor). Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
+      }
+    }
     let worktree: string | undefined
     let branch: string | undefined
+    let sub: string | undefined
     const wantTree = e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
     if (wantTree) {
       if (!isGit) return text('worktree requested but dir is not a git repo', true)
@@ -960,6 +1357,10 @@ export const register: Register = on => {
       if (made.exitCode !== 0) return text(`git worktree failed: ${made.stderr.trim()}`, true)
       worktree = path
       branch = `omp/${name}-${id}-${tag}`
+      // dir may be inside the repo: start the worker at the same place in its worktree (if it is tracked there).
+      const real = (await B?.realPath(dir)) ?? dir
+      const inside = real.startsWith(`${root}/`) ? real.slice(root.length) : ''
+      if (inside && (await $.fs.exists(`${path}${inside}`).catch(() => false))) sub = inside
     }
     const w: Worker = {
       id,
@@ -969,6 +1370,7 @@ export const register: Register = on => {
       root: isGit ? top!.stdout.trim() : dir,
       isGit,
       worktree,
+      sub,
       branch,
       model: currentModel,
       agent,
@@ -990,12 +1392,26 @@ export const register: Register = on => {
       genMs: 0,
       spark: [],
       maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
+      verify: typeof e.verify === 'string' && e.verify.trim() ? e.verify.trim() : undefined,
+      verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
+      fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
+      expect: Array.isArray(e.expect) ? (e.expect as unknown[]).map(String).filter(Boolean) : undefined,
+      effort: e.effort === undefined ? undefined : String(e.effort),
       cost: 0,
+      warn: [],
+      tokensCache: 0,
       sawEnd: false,
       turnChars: 0,
       ratio: 0.28,
       win: [],
       toolArgs: {},
+    }
+    // No worktree: remember when it started (to list what changed) and where the guard saves file originals (for pi_diff).
+    if (!w.worktree) {
+      w.marker = `${agentDir}/run/${sid}-${w.id}.marker`
+      w.snapDir = `${agentDir}/snap/${sid}-${w.id}`
+      await $.fs.write(w.marker, '').catch(() => undefined)
+      await $.fs.write(`${w.snapDir}/manifest.jsonl`, '').catch(() => undefined)
     }
     workers.set(id, w)
     void B?.ledger(0, 0, 1)
@@ -1004,11 +1420,11 @@ export const register: Register = on => {
     const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
     return text(
       `started ${id} [${agent}] "${w.title}" in ${workDir(w)}` +
-        (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with omp_dict (set) before the next spawn so workers stop re-learning the project.`),
+        (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
     )
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_dict' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_dict' }, async ($, e) => {
     const action = String(e.action ?? '')
     const dir = String(e.dir ?? cwd)
     if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
@@ -1055,28 +1471,28 @@ export const register: Register = on => {
     return text('action must be show, set or remove', true)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_status' }, async $ => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_status' }, async $ => {
     const led = await read($, ledgerAtom)
     if (!workers.size) return text(`no workers · session ${money(led.cost)}`)
     return text(
       [...workers.values()]
         .map(w => {
           const r = (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps
-          return `[${w.id}] ${w.state} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)} — ${w.title} — ${w.last}`
+          return `[${w.id}] ${w.state} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length}` : ''} — ${w.title} — ${w.last}`
         })
         .concat(`session total ${money(led.cost)} · ${led.spawned} spawned`)
         .join('\n'),
     )
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_digest' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_digest' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state !== 'running') w.isReported = true
     return text(await digest(w, e.detail === 'full'))
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_wait' }, async ($, e, next) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_wait' }, async ($, e, next) => {
     const ids = Array.isArray(e.ids) && e.ids.length
       ? (e.ids as string[])
       : [...workers.values()].filter(w => w.state === 'running').map(w => w.id)
@@ -1095,34 +1511,54 @@ export const register: Register = on => {
     }
     const parts: string[] = []
     for (const w of list) {
-      if (w.state !== 'running') w.isReported = true
-      parts.push(await digest(w))
+      if (w.state !== 'running') {
+        w.isReported = true
+        parts.push(await digest(w))
+        continue
+      }
+      // Still running: one line of what changed since the last wait, never the whole digest again.
+      const dSteps = w.steps - (w.waitSteps ?? 0)
+      const dFiles = w.files.size - (w.waitFiles ?? 0)
+      const quiet = w.lastAt ? Math.round((Date.now() - w.lastAt) / 1000) : 0
+      parts.push(
+        `[${w.id}] running ${elapsed(w)} · steps ${w.steps}${dSteps ? ` (+${dSteps})` : ' (no new steps)'} · files ${w.files.size}${dFiles ? ` (+${dFiles})` : ''} · now: ${w.last}${quiet > 20 ? ` · quiet ${quiet}s` : ''}`,
+      )
+      w.waitSteps = w.steps
+      w.waitFiles = w.files.size
     }
     const still = list.filter(w => w.state === 'running').length
-    if (still) parts.push(`(${still} still running; call omp_wait again)`)
+    if (still) parts.push(`(${still} still running; call pi_wait again)`)
     return text(parts.join('\n\n'))
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_send' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_send' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state === 'running') return text(`${w.id} is still running`, true)
-    if (!w.session) return text(`${w.id} has no session id to continue`, true)
+    if (!w.send && !w.session) return text(`${w.id} has no live process or session id to continue`, true)
+    const notReady = await ensureSetup()
+    if (notReady) return text(notReady, true)
     if (running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers`, true)
     const message = String(e.message ?? '').trim()
     if (!message) return text('message is required', true)
+    if (typeof e.maxMinutes === 'number' && e.maxMinutes > 0) w.maxMinutes = Math.min(e.maxMinutes, 240)
+    if (e.effort !== undefined) {
+      if (!THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+      w.effort = String(e.effort)
+    }
     w.texts = []
     w.errors = []
     B?.launch(w, message)
     await sync()
-    return text(`sent to ${w.id}`)
+    return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}`)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_diff' }, async ($, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_diff' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (!w.isGit) return text(`${w.id} is not in a git repo`, true)
     const cap = Math.min(Math.max(Number(e.maxChars ?? 8000), 500), 40000)
+    // No isolated worktree (a non-git dir, or worktree:false): diff against the originals the guard saved.
+    if (!w.worktree) return text((await B?.nonGitDiff(w, cap)) ?? 'not ready', false)
     const cwdW = workDir(w)
     const stat = await $.process.run(['git', 'diff', '--stat', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
     const diff = await $.process.run(['git', 'diff', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
@@ -1130,25 +1566,37 @@ export const register: Register = on => {
       cwd: cwdW,
       timeoutMs: 20_000,
     })
+    // New files have no tracked diff: show their content as additions (first few, so a review sees what was created).
+    const fresh = untracked.stdout.split('\n').filter(f => f && !/__pycache__|\.pyc$/.test(f))
+    const created: string[] = []
+    for (const f of fresh.slice(0, 8)) {
+      const d = await $.process.run(['git', 'diff', '--no-index', '--', '/dev/null', f], { cwd: cwdW, timeoutMs: 20_000 }).catch(() => undefined)
+      if (d?.stdout.trim()) created.push(clip(d.stdout.trimEnd(), 2500))
+    }
     const out = [
       stat.stdout.trim() || '(no tracked changes)',
-      untracked.stdout.trim() ? `untracked:\n${untracked.stdout.trim()}` : '',
+      fresh.length ? `untracked (${fresh.length}):\n${fresh.join('\n')}` : '',
       clip(diff.stdout, cap),
+      ...created,
+      fresh.length > 8 ? `(content shown for the first 8 of ${fresh.length} new files)` : '',
     ]
       .filter(Boolean)
       .join('\n\n')
     return text(out)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_kill' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_kill' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state !== 'running') return text(`${w.id} is already ${w.state}`)
+    w.killed = true
+    void w.send?.({ type: 'abort' })
     w.stop?.()
+    finish(w)
     return text(`killed ${w.id}`)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_merge' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_merge' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state === 'running') return text(`${w.id} is still running`, true)
@@ -1158,11 +1606,19 @@ export const register: Register = on => {
     if (dirty?.stdout.trim()) {
       return text(`main tree ${w.dir} has tracked changes; commit or stash them first`, true)
     }
-    await B.git(['add', '-A'], w.worktree)
+    // Stage the worker's changes but never build junk: an untracked __pycache__ from running tests would otherwise
+    // be committed by every worker and conflict add/add at the second merge.
+    await B.git(['add', '-A', '--', '.', ':(exclude,glob)**/__pycache__/**', ':(exclude,glob)**/*.pyc', ':(exclude,glob)**/.DS_Store'], w.worktree)
+    // A conflict hand-off (below) leaves a merge in progress in the worktree; never commit it with markers still in files.
+    const markers = await B.git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>) ', '--', '.'], w.worktree)
+    if (markers?.exitCode === 0 && markers.stdout.trim()) {
+      return text(`${w.id} still has conflict markers (${markers.stdout.trim().split('\n').slice(0, 4).join('; ')}). pi_send it to resolve them, then pi_merge again.`, true)
+    }
+    const merging = (await B.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], w.worktree))?.exitCode === 0
     const staged = await B.git(['diff', '--cached', '--quiet'], w.worktree)
-    if (staged?.exitCode === 1) {
+    if (staged?.exitCode === 1 || merging) {
       const c = await B.git(
-        ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '-m', `${w.title} (${w.id})`],
+        ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '--allow-empty', '-m', merging ? `Merge ${w.dir.split('/').pop()} into ${w.branch} (${w.id})` : `${w.title} (${w.id})`],
         w.worktree,
       )
       if (c?.exitCode !== 0) return text(`commit failed: ${c?.stderr.trim() ?? 'unknown'}`, true)
@@ -1176,9 +1632,20 @@ export const register: Register = on => {
     )
     if (m?.exitCode !== 0) {
       const files = await B.git(['diff', '--name-only', '--diff-filter=U'], w.dir)
+      const list = files?.stdout.trim().split('\n').join(', ') || m?.stderr.trim()
       await B.git(['merge', '--abort'], w.dir)
+      // Hand the conflict to the worker: merge the main tree's current commit into its worktree, leaving markers
+      // for it to resolve. The main tree stays clean either way.
+      const head = (await B.git(['rev-parse', 'HEAD'], w.dir))?.stdout.trim()
+      const pre = head
+        ? await B.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-commit', '--no-ff', head], w.worktree)
+        : undefined
+      const handed = pre && pre.exitCode !== 0 && (await B.git(['diff', '--name-only', '--diff-filter=U'], w.worktree))?.stdout.trim()
       return text(
-        `merge conflict, aborted. conflicting: ${files?.stdout.trim().split('\n').join(', ') || m?.stderr.trim()}`,
+        `merge conflict, aborted; the main tree is untouched. conflicting: ${list}.` +
+          (handed
+            ? `\nThe same conflict is now in ${w.id}'s worktree as <<<<<<< markers (${handed.split('\n').join(', ')}). pi_send ${w.id}: "resolve the conflict markers in those files so both sides' intent is kept, edit files only (no git), run the tests, and report", wait, review pi_diff, then pi_merge ${w.id} again.`
+            : `\nCould not stage the conflict in the worktree; merge by hand or re-spawn on the current branch.`),
         true,
       )
     }
@@ -1186,23 +1653,25 @@ export const register: Register = on => {
     return text(`merged ${w.branch} into ${w.dir}\n${stat?.stdout.trim() ?? ''}`)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__omp_cleanup' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_cleanup' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state === 'running') return text(`${w.id} is still running; omp_kill it first`, true)
+    if (w.state === 'running') return text(`${w.id} is still running; pi_kill it first`, true)
     if (!B) return text('not ready', true)
     if (w.worktree && w.branch) {
       if (e.force !== true) {
         const dirty = await B.git(['status', '--porcelain'], w.worktree)
         const ahead = await B.git(['rev-list', '--count', `HEAD..${w.branch}`], w.dir)
         if (dirty?.stdout.trim() || Number(ahead?.stdout.trim() ?? 0) > 0) {
-          return text(`${w.id} has unmerged work; omp_merge it first or pass force:true`, true)
+          return text(`${w.id} has unmerged work; pi_merge it first or pass force:true`, true)
         }
       }
       const rm = await B.git(['worktree', 'remove', '--force', w.worktree], w.dir)
       if (rm?.exitCode !== 0) return text(`worktree remove failed: ${rm?.stderr.trim()}`, true)
       await B.git(['branch', '-D', w.branch], w.dir)
     }
+    w.stop?.()
+    await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${w.id}`, `${agentDir}/snap/${sid}-${w.id}`, `${agentDir}/run/${sid}-${w.id}.marker`], { timeoutMs: 15_000 }).catch(() => undefined)
     workers.delete(w.id)
     await sync()
     return text(`cleaned up ${w.id}`)
@@ -1350,9 +1819,11 @@ export const register: Register = on => {
               ? `✖ failed ${mmss(elapsedMs)}`
               : `■ stopped ${mmss(elapsedMs)}`
       const badgeColor = w.state === 'running' ? sp.color : w.state === 'done' ? '#50fa7b' : w.state === 'failed' ? '#ff5555' : '#6272a4'
+      // A silent stretch (the model is between tokens, or a tool is running) ticks up so the card never looks frozen.
+      const quiet = w.state === 'running' && w.lastAt && now - w.lastAt > 3000 ? `  · quiet ${Math.round((now - w.lastAt) / 1000)}s` : ''
       const activity =
         w.state === 'running'
-          ? w.last
+          ? `${w.last}${quiet}`
           : w.state === 'done'
             ? (w.note ?? 'finished')
             : w.state === 'failed'
@@ -1407,7 +1878,7 @@ export const register: Register = on => {
             <Avatar w={{ id: 'w0', state: 'killed', title: '', startedAt: 0, last: '', files: 0, tokens: 0, errors: 0 }} f={frame} />
             <Box flexDirection="column">
               <Text bold>No workers yet</Text>
-              <Text dimColor>Ask Claude to omp_spawn some and they will show up here.</Text>
+              <Text dimColor>Ask Claude to pi_spawn some and they will show up here.</Text>
             </Box>
           </Box>
         )}
