@@ -407,7 +407,8 @@ const AGENTS: Record<string, AgentType> = {
   },
   manager: {
     about: 'sub-orchestrator: decomposes one feature and delegates isolated slices to sub-workers; tools: read, grep, find, ls, bash plus sub_* manager tools; worktree required',
-    tools: READ_ONLY.concat(['bash']),
+    // Pi's --tools is an allowlist that also filters extension tools, so the sub_* tools from extensions/manager.ts must be named here.
+    tools: READ_ONLY.concat(['bash', 'sub_spawn', 'sub_wait', 'sub_status', 'sub_digest', 'sub_diff', 'sub_send', 'sub_merge', 'sub_cleanup', 'sub_kill', 'sub_log', 'sub_btw']),
     worktree: 'auto',
     report: 'detailed',
     maxMinutes: 60,
