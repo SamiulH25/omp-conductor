@@ -25,18 +25,30 @@ Restart Claude Code, then run `/pi-setup`: it prints the full install guide (Pi,
 
 Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-pi` skill gives it the playbook.
 
+## Two ways to use it
+
+The `orchestrate-pi` skill describes two modes; say which you want.
+
+1. **Orchestrator and quick fixer**: the main model only plans, briefs workers, reads digests and diffs, merges, and makes small fixes itself. Workers do all the implementation (use `pi_plan`, `pi_map`, `pi_race`, `reviewBy`).
+2. **Main implementer**: the main model writes the code that needs its judgment and hands workers only tedious, well-bounded side tasks (boilerplate, tests for code it wrote, docs, mechanical migrations, searches, reviews) while it keeps working.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `pi_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`, `effort`, `verify`, `verifyTimeoutSec`, `fixRounds`, `expect`, `checks`, `skills`, `noDict`). Returns an id at once. `skills` pushes skills Claude has (project/user `.claude/skills` and installed plugins, e.g. `godot-prompter:state-machine`) onto the worker with Pi's `--skill`. A `dev`/`general` worker is refused until the project has a dictionary (`pi_dict`), unless `noDict: true`. |
+| `pi_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`, `effort`, `verify`, `verifyTimeoutSec`, `fixRounds`, `expect`, `checks`, `skills`, `noDict`, `owns`, `after`, `maxCost`, `reviewBy`, `codex`). Returns an id at once, or queues the worker when all 4 slots are busy. `skills` pushes skills Claude has (project/user `.claude/skills` and installed plugins, e.g. `godot-prompter:state-machine`) onto the worker with Pi's `--skill`. A `dev`/`general` worker is refused until the project has a dictionary (`pi_dict`), unless `noDict: true`. |
 | `pi_status` | One line per worker, with live tok/s and cost, plus the session total. |
 | `pi_digest` | Compact report: files, commands, errors, git status, and the worker's own summary (when a worker gives none and its reply is long, Claude Haiku compresses it, labelled `summary (haiku)`). `detail: "full"` adds recent events. |
-| `pi_wait` | Wait up to 90 s. Finished workers get their full digest; workers still running get one line of what changed since the last wait (steps, files, current activity), never the same digest again. |
+| `pi_wait` | Blocks (default 300 s, max 900) until something happens, then returns digests of what changed: by default it returns immediately when the first watched worker finishes, fails, is killed, starts after queueing, or gets a new ⚠ warning, so one call replaces many polls. `mode: "all"` waits for every watched worker, `"any"` for the first to finish. |
+| `pi_log` | A worker's recent activity (tool calls, errors, text) by event index, to debug a bad run. |
+| `pi_race` | Best-of-N: the same task on 2-4 workers (optionally different models); `pi_wait` ranks the results (checks/verify passed, fewer warnings, smaller diff). |
+| `pi_map` | One worker per item from a task template with `{item}` (max 20), through the normal queue. Rollup line when all are done. |
+| `pi_plan` / `pi_spawn_plan` | A read-only planner turns a goal into a task DAG (`PLAN:` JSON); `pi_spawn_plan` validates it and spawns every task with `after`/`owns` mapped to real worker ids. |
+| `pi_notes` | Per-project handoff notes (`show`/`add`/`clear`) injected into every new worker; workers append with the `note` command. |
 | `pi_btw` | Ask a running worker why it is taking a long time or has gone quiet, without interrupting it (`id`, optional `question`, `timeoutSec` up to 90, `force` to bypass rate limits). |
-| `pi_send` | Follow-up to a finished or timed-out worker (optional `maxMinutes`, `effort`, `skills` to add more). Goes to its live Pi process, so it keeps everything it learned; after 30 idle minutes the process is stopped and the saved session is resumed instead. Workers are RPC processes, so prefer sending a fix or the next task in the same area to an existing worker over spawning a new one: no re-reading, no re-learning the layout. |
+| `pi_send` | Follow-up to a finished or timed-out worker (optional `maxMinutes`, `effort`, `skills` to add more). `interrupt: true` aborts a running worker and redirects it in the same process. Goes to its live Pi process, so it keeps everything it learned; after 30 idle minutes the process is stopped and the saved session is resumed instead. Workers are RPC processes, so prefer sending a fix or the next task in the same area to an existing worker over spawning a new one: no re-reading, no re-learning the layout. |
 | `pi_diff` | Review a worker's changes: `git diff` plus the content of new files for a worktree worker; for a worker with no worktree (non-git dir, or `worktree:false`) a diff of every file it edited against the original the guard saved, plus the other files changed since the spawn. |
-| `pi_merge` | Commit the worker's changes (never `__pycache__`/`.pyc`) and merge its branch `--no-ff`. On a conflict the main tree is left untouched and the same conflict is staged as markers in the worker's worktree, so you `pi_send` the worker to resolve it and `pi_merge` again; it refuses to commit while markers remain. |
+| `pi_merge` | Serialized across workers; runs the required toolbox checks after the merge and reverts it if one fails. Commit the worker's changes (never `__pycache__`/`.pyc`) and merge its branch `--no-ff`. On a conflict the main tree is left untouched and the same conflict is staged as markers in the worker's worktree, so you `pi_send` the worker to resolve it and `pi_merge` again; it refuses to commit while markers remain. |
 | `pi_cleanup` | Remove the worktree and branch and forget the worker; refuses unmerged work unless `force`. |
 | `pi_dict` | Project dictionary: `show`, `set` (upsert `{term, definition}` entries) or `remove`. Kept per project root (git toplevel) in the plugin store and injected into every worker's system prompt. The orchestrator seeds it before the first spawn and adds only reviewed facts. Capped at 6000 chars, 300 per entry. |
 | `pi_tools` | Project toolbox: the checks (compile, tests, lint) workers run themselves with `check <name>`. `show`, `set`, `remove`, `reset`. `required` checks must run after a worker's last edit; `serial` checks hold a project-wide lock so parallel workers queue instead of colliding. Unity projects get `unity-compile`, `unity-editmode` and `unity-playmode` by default. |
@@ -46,11 +58,25 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-pi` skil
 
 `/codex-worker` picks the model for `codex:true` workers: any `openai/*` model in Pi's catalog (ChatGPT sign-in). `/codex-worker` shows it, `/codex-worker list` lists models, `/codex-worker <name> [effort]` sets it (e.g. `/codex-worker gpt-5.3-codex high`), `/codex-worker <effort>` changes only the effort, `/codex-worker reset` restores GPT-6 Luna at xhigh. Applies to codex workers spawned afterwards; running workers keep theirs.
 
+`/pi-model <agentType> <model>` sets a model for one agent type (`general`, `dev`, `explore`, `review`); `/pi-model <agentType> reset` clears it; plain `/pi-model` lists the global model and overrides.
+
+`/pi-budget` shows the session cost cap, `/pi-budget <usd>` sets it, `/pi-budget off` clears it. A per-worker `maxCost` on `pi_spawn` works the same way: at 80% the worker is told to wrap up, at 100% it is stopped and marked budget exceeded (partial work stays reviewable); flat-rate models never trip a budget.
+
+`/pi-agents` lists the agent types, including custom ones from `~/.pi-workers/agents.json` (name -> `{description, tools, prompt, report: "summary"|"findings", worktree?, model?, effort?}`).
+
 `/pi-effort` shows the reasoning effort workers use. `/pi-effort <off|minimal|low|medium|high|xhigh|max>` switches it (Pi `--thinking` levels; Pi clamps to what the model supports). `/pi-effort reset` restores `low`. Kept across sessions and applied to workers started or resumed afterwards.
 
 `/btw <id> [question]` asks a running worker for a separate progress update without steering or interrupting it. Calls are limited to one per worker every 30 seconds and five total unless forced; btw calls are not included in the cost total.
 
 `/conductor` opens a pane (run it again to close it) with a card per worker: an animated avatar (four species, with faces for running, done, failed and stopped), what it is working on, an animated progress bar, live speed (⚡ tok/s with a sparkline), files, tokens, cost and model. A footer keeps the cost, tokens and worker count for the whole session, including workers you have already cleaned up. The avatar reacts to what the worker is doing: eyes sweep while it reads or searches, squint and "type" while it edits, go wide on shell commands, look up with a thinking indicator between tools, and blink slowly after 10 s of silence. One-shot reactions show a wince on a tool error, a smile and ✓ on a file written, and a nod at the end of a turn. A badge beside the face shows the agent type (⌕ explore, ✎ review, ⚒ dev). `/conductor demo` toggles sample workers in every state so you can preview it. The status line shows counts.
+
+## Scheduling, safety and recovery
+
+- **Queue and dependencies**: spawns beyond 4 queue (FIFO); `after: [ids]` starts a worker when its upstream workers are done and passes their reports; a failed upstream fails the dependent clearly.
+- **File ownership**: `owns: [globs]` is enforced by the worker guard on edit/write and checked for overlap at spawn and on `pi_send`; `pi_diff` flags files outside it.
+- **Review chaining**: `reviewBy` spawns a reviewer on the diff and feeds blocking findings back as fix rounds (`reviewRounds`, default 1).
+- **Stuck detection**: no activity for 4 minutes, repeated identical tool calls, or repeated errors raise a ⚠ and ask the worker why (via btw).
+- **Persistence**: the worker registry is saved under `~/.pi-workers/registry.json`; after a restart workers come back as interrupted and resume with `pi_send`. Finished workers whose worktree is gone are pruned after 14 days.
 
 ## Agent types
 
