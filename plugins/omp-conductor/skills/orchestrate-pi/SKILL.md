@@ -1,11 +1,34 @@
 ---
 name: orchestrate-pi
-description: Use when a task splits into independent pieces that Pi workers can do in parallel (pi_spawn, pi_tools, pi_wait, pi_btw, pi_digest, pi_diff, pi_merge, pi_cleanup). Covers briefing workers, the checks workers run themselves, reviewing real diffs instead of summaries, and merging.
+description: Use when work can be handed to Pi workers (pi_spawn, pi_race, pi_map, pi_plan, pi_wait, pi_btw, pi_digest, pi_diff, pi_merge, pi_cleanup, pi_tools). Two modes — Orchestrator (you only plan, delegate, review, merge and make quick fixes) or Implementer (you do the real work and hand workers only tedious side tasks). Covers briefing workers, the checks workers run themselves, reviewing real diffs instead of summaries, and merging.
 ---
 
 # Orchestrating Pi workers
 
-You are the judge. Workers (Pi, one long-lived `pi --mode rpc` process each) do the grunt work; you decide what is accepted.
+Workers (Pi, one long-lived `pi --mode rpc` process each) are cheap, parallel hands. There are two ways to use them. **Pick the mode first**, from what the user said ("orchestrate", "delegate", "have the workers do it" → Mode 1; "you build it", "you implement, use workers for the boring parts" → Mode 2). If the user said nothing and the task is more than a quick change, use Mode 1.
+
+## Mode 1: Orchestrator and quick fixer
+
+You are the judge and the planner. You write almost no code yourself: workers implement, you decide what is accepted.
+
+- **Do yourself**: decomposing, writing briefs, reading digests and diffs, merging, running the final tests, and quick fixes (a few lines, a typo, a one-file correction after review). A fix is quick when briefing a worker would cost more than making it.
+- **Delegate everything else**: every feature, refactor, investigation and test-writing task goes to a worker. If you catch yourself opening files to implement something, stop and spawn a worker instead.
+- **Fan out**: split the job into pieces on disjoint files and run them in parallel. For a big goal use `pi_plan` (a read-only planner returns a task DAG), review it, then `pi_spawn_plan`. For the same task over many targets use `pi_map`. For a hard problem where the approach is uncertain use `pi_race` (best-of-N) and merge the best.
+- **Gate with workers too**: add `reviewBy` so a reviewer worker checks each diff and sends blocking findings back for a fix round, instead of you reading every line. Still skim `pi_diff` for anything that matters.
+- **Wait cheaply**: `pi_wait` blocks until something actually happens (see Loop); do not poll `pi_status`.
+- Keep your own context small: read digests, not logs; use `pi_log` and `pi_btw` only when a worker looks stuck.
+
+## Mode 2: Main implementer with worker helpers
+
+You are the implementer. You write the code that needs your judgment, the design, the tricky logic and anything touching many files at once. Workers only take **tedious, well-bounded side tasks that do not need your direct work**, running in the background while you keep implementing.
+
+- **Good tasks to hand off**: boilerplate and repetitive edits across many files (`pi_map`), writing or extending tests for code you already wrote, docs and comments, renames and mechanical migrations, searching the codebase and reporting (`explore`), reviewing your own diff (`review`), running slow checks and fixing their simple failures, data entry, small isolated utilities with a clear signature.
+- **Keep yourself**: architecture, the core feature, anything where the worker would need to read this conversation to get it right, and the final integration.
+- Hand off early and keep working: `pi_spawn` returns at once, so spawn the side task, continue your own work, and collect it later with `pi_wait` or `pi_digest` at a natural pause. Give workers `owns` patterns for the files they may touch so they never collide with the files you are editing; their worktrees keep your tree clean until you `pi_merge`.
+- Briefs stay standalone and small (goal, files, how to verify). Use `explore` workers for reading so your context stays free for the implementation.
+- Review what comes back like any other change: `pi_diff`, then `pi_merge` (it needs a clean main tree, so commit or stash your own tracked edits first).
+
+Everything below applies to both modes.
 
 ## Reuse workers: they are RPC processes, not one-shot calls
 
@@ -27,6 +50,7 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 - `explore`: read-only investigation (where is X, how does Y work, what calls Z). Returns a long `FINDINGS:` report with file:line evidence. Read it as the real answer; it is deliberately not summarized, so keep the question narrow enough that the report is worth its tokens.
 - `review`: read-only review of existing code or a worker's output. Returns issues by severity with file:line and a fix.
+- `planner`: read-only; turns a goal into a task DAG (`PLAN:` JSON) for `pi_spawn_plan`. Usually started through `pi_plan`.
 - `dev`: implements changes in a worktree. Returns a short summary; verify with `pi_diff`.
 - `general`: unrestricted, the default when you do not pick. Prefer a specific type.
 
@@ -55,7 +79,7 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 1. **Decompose** into pieces that touch different files. Overlapping pieces will conflict at merge.
 2. **Brief** each worker with `pi_spawn`. The brief must stand alone: the worker cannot see this conversation (it does see the project dictionary and its toolbox). State the goal, the files it may touch, which tests cover the change (so it can filter its test check), and "touch no other files". Do not ask for a SUMMARY or FINDINGS block; the plugin adds the right reporting instruction for the agent type.
-3. **Wait** with `pi_wait`. A call waits up to 90 seconds; call again while workers are still running. `pi_status` shows live tok/s and cost per worker, plus the session total, if you only need a glance; do not poll it in a loop.
+3. **Wait** with `pi_wait` and no arguments. It blocks (up to its time limit) until something actually happens: a worker finishes, fails, starts after being queued, or raises a ⚠ warning, then returns just the digests of what changed, so one call covers the whole batch. Call it again for the rest. `mode: "all"` waits for every watched worker instead. `pi_status` shows live tok/s and cost per worker, plus the session total, if you only need a glance; do not poll it in a loop.
 4. **Review** with `pi_digest`, then verify the claims with `pi_diff`. A digest is what the worker says it did plus `git status` taken from the repo. Read the diff before accepting anything that matters.
 5. **Judge**:
    - Good: `pi_merge`, then `pi_cleanup`. Add any durable, verified project fact the work revealed to `pi_dict`.
@@ -66,7 +90,20 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 ## When a worker is quiet or slow
 
-When `pi_wait` shows a worker running past its expected time or quiet, call `pi_btw` before killing or steering it. If it is stuck or looping, `pi_send` a steer or `pi_kill`; if it is making progress, keep waiting.
+When a worker runs past its expected time or goes quiet (the plugin also flags `possibly stuck` / `looping` as a ⚠ and, where it can, attaches the worker's own explanation), call `pi_btw` before killing or steering it: it asks the running worker what it is doing and why without interrupting it. `pi_log` shows its recent tool calls and errors. If it is stuck or looping, redirect it with `pi_send` and `interrupt: true` (aborts the run and sends the new instruction in the same process, keeping its context) or `pi_kill`; if it is making progress, keep waiting.
+
+## Scheduling, safety and cost
+
+- **Queue**: spawning past the 4-worker limit queues the worker and starts it when a slot frees; `pi_wait` covers queued workers.
+- **`after: [ids]`**: the worker starts when its upstream workers are done and receives their reports. A failed upstream fails the dependent with a clear reason.
+- **`owns: [globs]`**: the files a worker may edit. Overlapping owners are refused at spawn and the worker's edit tool is blocked outside its patterns; `pi_diff` flags anything outside. This is how parallel workers avoid merge conflicts.
+- **Budgets**: `maxCost` per worker on `pi_spawn`, and a session cap with `/pi-budget`. At 80% the worker is told to wrap up; at 100% it is stopped and marked budget exceeded (its partial work stays reviewable).
+- **Models**: `/pi-model <agentType> <model>` gives explore/review/dev/general their own model (cheap for reading, stronger for dev); `codex: true` still overrides for the hardest tasks.
+- **Merging**: `pi_merge` is serialized, refuses a branch that cannot be brought up to date, runs the required toolbox checks after the merge and reverts it if they fail.
+- **Shared notes**: `pi_notes` holds per-project notes injected into every new worker; workers append with the `note` command. Use it for facts discovered mid-batch (unlike `pi_dict`, which is for verified long-lived facts).
+- **Custom agent types**: extra types can be defined in `~/.pi-workers/agents.json`; `/pi-agents` lists what is available.
+- **Restarts**: workers and worktrees survive a Claude Code restart. Interrupted ones show in `pi_status` and resume with `pi_send`.
+
 
 ## Skills (push what you know onto workers)
 
@@ -93,4 +130,4 @@ Workers start with no skills. Pass `skills` on `pi_spawn` with the ones from you
 - `pi_merge` refuses while the main tree has tracked changes, and aborts cleanly on a conflict. On a conflict, `pi_send` the worker a request to rebase onto the current branch, or merge by hand.
 - `pi_cleanup` refuses to delete unmerged work unless `force` is true. Never force it without reading the diff.
 - A "worker finished" message from the plugin may arrive for a worker you already reviewed. Ignore it.
-- Every worker uses the one model the user chose with `/pi-model` (default `opencode-go/deepseek-v4.1-flash`) and the one reasoning effort set with `/pi-effort` (default low). The only per-task choices are `effort`, `skills` and `codex: true` (the `/codex-worker` model and effort). If `pi_spawn` says the ChatGPT sign-in is missing, pass its instructions to the user.
+- A worker uses the model the user chose with `/pi-model` (global, or per agent type) and the reasoning effort set with `/pi-effort` (default low). The only per-task choices are `effort`, `skills` and `codex: true` (the `/codex-worker` model and effort). If `pi_spawn` says the ChatGPT sign-in is missing, pass its instructions to the user.
