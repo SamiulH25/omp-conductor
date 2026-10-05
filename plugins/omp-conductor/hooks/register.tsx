@@ -333,6 +333,27 @@ const elapsed = (w: Worker) => {
   return sec >= 60 ? `${Math.floor(sec / 60)}m${sec % 60}s` : `${sec}s`
 }
 
+// The project's toolbox: what the supervisor set with pi_tools, else the built-in Unity checks for a Unity project
+// (at the repo root or at dir inside it). `sub` is where the Unity project sits inside the root.
+// Top level: the engine only lets `$` be handed to a function declared at the top of the module.
+type Toolbox = { checks: Record<string, Check>; source: 'set' | 'unity default' | 'none'; sub: string }
+async function loadTools($: any, root: string, dir: string): Promise<Toolbox> {
+  const st = await $.fs.stat(dir, { resolve: true }).catch(() => undefined)
+  const real = String((st as { realPath?: string } | undefined)?.realPath ?? dir).replace(/\/+$/, '')
+  let unity: string | undefined
+  for (const p of real === root || !real.startsWith(`${root}/`) ? [root] : [real, root]) {
+    if (await $.fs.exists(`${p}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) {
+      unity = p.slice(root.length)
+      break
+    }
+  }
+  // A stored toolbox wins, even an empty one (every check removed on purpose); reset brings back the default.
+  const set = (await $.store.get(TOOLS_PREFIX + root).catch(() => undefined)) as Record<string, Check> | undefined
+  if (set && typeof set === 'object') return { checks: set, source: 'set', sub: unity ?? '' }
+  if (unity !== undefined) return { checks: UNITY_TOOLS, source: 'unity default', sub: unity }
+  return { checks: {}, source: 'none', sub: '' }
+}
+
 export const register: Register = on => {
   const workers = new Map<string, Worker>()
   let B: Bridge | undefined
@@ -666,24 +687,6 @@ export const register: Register = on => {
     return workers.get(id)
   }
 
-  // The project's toolbox: what the supervisor set with pi_tools, else the built-in Unity checks for a Unity project
-  // (at the repo root or at dir inside it). `sub` is where the Unity project sits inside the root.
-  type Toolbox = { checks: Record<string, Check>; source: 'set' | 'unity default' | 'none'; sub: string }
-  const loadTools = async ($: any, root: string, dir: string): Promise<Toolbox> => {
-    const real = ((await B?.realPath(dir)) ?? dir).replace(/\/+$/, '')
-    let unity: string | undefined
-    for (const p of real === root || !real.startsWith(`${root}/`) ? [root] : [real, root]) {
-      if (await $.fs.exists(`${p}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) {
-        unity = p.slice(root.length)
-        break
-      }
-    }
-    // A stored toolbox wins, even an empty one (every check removed on purpose); reset brings back the default.
-    const set = (await $.store.get(TOOLS_PREFIX + root).catch(() => undefined)) as Record<string, Check> | undefined
-    if (set && typeof set === 'object') return { checks: set, source: 'set', sub: unity ?? '' }
-    if (unity !== undefined) return { checks: UNITY_TOOLS, source: 'unity default', sub: unity }
-    return { checks: {}, source: 'none', sub: '' }
-  }
   const toolsText = (t: Toolbox) =>
     Object.entries(t.checks)
       .map(([n, c]) => `- ${n}${c.required ? ' (required)' : ''}${c.serial ? ' [serial]' : ''}: ${c.purpose}\n    runs: ${c.command}`)
