@@ -17,6 +17,11 @@ const SUMMARY_MODEL = 'haiku' // the one other model: compresses a long worker r
 const DEFAULT_MODEL = 'opencode-go/deepseek-v4.1-flash'
 const DEFAULT_THINKING = 'low' // reasoning effort workers start with; /pi-effort changes it
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] // pi --thinking values
+// pi_spawn codex:true pins a worker to Codex (default GPT-6 Luna, any openai/* model via /codex-worker) through the ChatGPT sign-in of Pi's `openai` provider, at xhigh.
+const CODEX_MODEL = 'openai/gpt-6-luna' // default; /codex-worker changes it to any openai/* model
+const CODEX_THINKING = 'xhigh' // default; /codex-worker <model> <effort> changes it
+const CODEX_LOGIN = `Codex workers need a ChatGPT sign-in in the workers' own Pi agent dir (separate from your main Pi login, so the two never fight over token refreshes). Run once in a terminal:\n  PI_CODING_AGENT_DIR=~/.pi-workers pi\nthen /login → OpenAI → Sign in with ChatGPT, and quit Pi. No restart needed.`
+const MAX_SKILLS = 8 // per worker: each one costs a line in the system prompt and a read
 const AGENT_DIR_NAME = '.pi-workers' // under $HOME: PI_CODING_AGENT_DIR for every worker
 const KEY_VARS = ['OPENCODE_GO_API_KEY', 'OPENCODE_API_KEY'] // OpenCode Go key: env file in the agent dir, or the environment
 const SOFT_FRACTION = 0.85 // at this share of the time limit the worker is told to wrap up
@@ -267,6 +272,8 @@ type Worker = {
   checkRuns?: { name: string; ok: boolean; exit: number; secs: number }[] // the `check` runs of the last run, oldest first
   effort?: string // per-worker reasoning effort override
   effortSent?: string
+  codex?: boolean // pinned to the /codex-worker model and effort at spawn, for its whole life, resumes included
+  skills?: Skill[] // skills the supervisor pushed (pi_spawn / pi_send): --skill on every process start
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
   snapDir?: string // non-git dirs: originals of files the worker edited (written by the guard extension)
   tokensCache: number
@@ -365,6 +372,70 @@ async function loadTools($: any, root: string, dir: string): Promise<Toolbox> {
   return { checks: {}, source: 'none', sub: '' }
 }
 
+// The skills Claude itself has: the project's .claude/skills, the user's ~/.claude/skills, and every installed plugin's
+// skills/ (named plugin:skill, as Claude lists them). pi_spawn / pi_send push the chosen ones onto a worker.
+type Skill = { name: string; path: string; about: string }
+const skillAbout = (md: string) => {
+  const head = md.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? ''
+  return clip(one(head.match(/^description:\s*(?:[>|][-+]?\s*\n\s+)?["']?(.+?)["']?\s*$/m)?.[1] ?? ''), 200)
+}
+async function skillCatalog($: any, home: string, root: string): Promise<Skill[]> {
+  const out: Skill[] = []
+  const scan = async (base: string, ns: string) => {
+    const entries = ((await $.fs.list(base).catch(() => [])) as { name: string; kind: string; isLink?: boolean }[]).sort((a, b) => a.name.localeCompare(b.name))
+    for (const d of entries) {
+      if (d.kind !== 'dir' && !d.isLink) continue
+      const md = await $.fs.read(`${base}/${d.name}/SKILL.md`).catch(() => undefined)
+      if (md === undefined) continue
+      out.push({ name: ns ? `${ns}:${d.name}` : d.name, path: `${base}/${d.name}`, about: skillAbout(String(md)) })
+    }
+  }
+  if (root) await scan(`${root}/.claude/skills`, '')
+  if (home) await scan(`${home}/.claude/skills`, '')
+  const reg = await $.fs.read(`${home}/.claude/plugins/installed_plugins.json`).catch(() => undefined)
+  let plugins: Record<string, { installPath?: string }[]> = {}
+  try {
+    plugins = (JSON.parse(String(reg ?? '{}')) as { plugins?: typeof plugins }).plugins ?? {}
+  } catch {
+    // unreadable registry: plugin skills are simply not offered
+  }
+  for (const [key, installs] of Object.entries(plugins)) {
+    const at = installs.at(-1)?.installPath
+    if (at) await scan(`${at}/skills`, key.split('@')[0]!)
+  }
+  return out
+}
+// Matches each requested name against the catalog: an exact name, a bare skill name when only one plugin has it,
+// or a path to a skill directory or its SKILL.md.
+async function resolveSkills($: any, home: string, root: string, wanted: string[]): Promise<{ found: Skill[]; missing: string[]; catalog: Skill[] }> {
+  const catalog = await skillCatalog($, home, root)
+  const found: Skill[] = []
+  const missing: string[] = []
+  for (const raw of wanted) {
+    const want = raw.trim().replace(/^\//, '')
+    let hit = catalog.find(s => s.name === want) ?? (() => {
+      const bare = catalog.filter(s => s.name.split(':').at(-1) === want)
+      return bare.length === 1 ? bare[0] : undefined
+    })()
+    if (!hit && /^[~/]/.test(raw.trim())) {
+      const dir = raw.trim().replace(/^~(?=\/)/, home).replace(/\/SKILL\.md$/, '').replace(/\/+$/, '')
+      const md = await $.fs.read(`${dir}/SKILL.md`).catch(() => undefined)
+      if (md !== undefined) hit = { name: dir.slice(dir.lastIndexOf('/') + 1), path: dir, about: skillAbout(String(md)) }
+    }
+    if (!hit) missing.push(raw)
+    else if (!found.some(s => s.path === hit!.path)) found.push(hit)
+  }
+  return { found, missing, catalog }
+}
+const unknownSkills = (missing: string[], catalog: Skill[]) => {
+  // Rank by how many words of the skill's own name (not its plugin) appear in what was asked for.
+  const asked = missing.join(' ').toLowerCase()
+  const score = (s: Skill) => s.name.split(':').at(-1)!.split(/[-_]/).filter(t => t.length > 2 && asked.includes(t)).length
+  const near = catalog.map(s => [s, score(s)] as const).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([s]) => s)
+  return `unknown skill(s): ${missing.join(', ')}.${near.length ? ` Close matches: ${near.map(s => s.name).join(', ')}.` : ''} ${catalog.length} skills are installed; name one as plugin:skill, a bare skill name, or a path to its directory.`
+}
+const skillsText = (skills: Skill[]) =>skills.map(s => `- ${s.name}: ${s.path}/SKILL.md${s.about ? ` (${s.about})` : ''}`).join('\n')
+
 // /pi-setup: the install guide, shareable with someone setting it up from scratch.
 const REPO = 'SamiulH25/omp-conductor'
 const BRANCH = 'pi-backend'
@@ -413,11 +484,14 @@ export const register: Register = on => {
   let demoOn = false
   let currentModel = DEFAULT_MODEL
   let currentThinking = DEFAULT_THINKING
+  let codexModel = CODEX_MODEL
+  let codexThinking = CODEX_THINKING
   let agentDir = ''
   let apiKey = ''
   let sid = ''
   let hostPath = ''
   let ensureSetup: () => Promise<string | undefined> = async () => undefined
+  let codexReady: () => Promise<boolean> = async () => false
   let setupProblems: string[] = ['setup not checked yet']
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
   let seq = 0
@@ -785,6 +859,15 @@ export const register: Register = on => {
       setupProblems = await checkSetup()
       return setupProblems.length ? SETUP_HELP.replace('{problems}', setupProblems.join('\n')) : undefined
     }
+    // Read fresh each time, so a /login made after the session started counts at once.
+    codexReady = async () => {
+      const auth = await $.fs.read(`${agentDir}/auth.json`).catch(() => undefined)
+      try {
+        return !!(JSON.parse(String(auth ?? '{}')) as Record<string, unknown>).openai
+      } catch {
+        return false
+      }
+    }
     // Command files of workers whose session is long gone (a stop at shutdown can lose its rm).
     void $.process.run(['find', `${agentDir}/run`, '(', '-name', '*.jsonl', '-o', '-name', '*.marker', ')', '-mmin', '+180', '-delete'], { timeoutMs: 10_000 }).catch(() => undefined)
     void $.process.run(['find', `${agentDir}/tmp`, `${agentDir}/snap`, '-mindepth', '1', '-maxdepth', '1', '-mmin', '+2880', '-exec', 'rm', '-rf', '{}', '+'], { timeoutMs: 10_000 }).catch(() => undefined)
@@ -804,6 +887,9 @@ export const register: Register = on => {
     const savedThinking = String((await $.store.get('thinking').catch(() => undefined)) || DEFAULT_THINKING)
     currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
     await update($, thinkingAtom, () => currentThinking)
+    codexModel = String((await $.store.get('codexModel').catch(() => undefined)) || CODEX_MODEL)
+    const savedCodexThinking = String((await $.store.get('codexThinking').catch(() => undefined)) || '')
+    codexThinking = THINKING_LEVELS.includes(savedCodexThinking) ? savedCodexThinking : CODEX_THINKING
     let lastSig = ''
     let verifyChain: Promise<unknown> = Promise.resolve() // verify commands run one at a time (a locked editor cannot run two)
     const storeKey = `${STORE_PREFIX}${await $.session.id()}`
@@ -821,6 +907,8 @@ export const register: Register = on => {
       checks: w.checks,
       checkRuns: w.checkRuns,
       effort: w.effort,
+      codex: w.codex,
+      skills: w.skills,
       marker: w.marker,
       snapDir: w.snapDir,
       tokensCache: w.tokensCache,
@@ -1171,13 +1259,14 @@ export const register: Register = on => {
       const file = cmdFile(w)
       await $.fs.write(file, '').catch(() => undefined)
       await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
-      w.model = currentModel
+      w.model = w.codex ? w.model || codexModel : currentModel
       const args = [
-        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', currentModel, '--thinking', w.effort ?? currentThinking,
+        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', w.model, '--thinking', w.effort ?? currentThinking,
         '--offline', '-ne', '-ns', '-np', '-nc', '-na',
       ]
       args.push('-e', `${$.plugin.root}/extensions/guard.ts`)
       if (kind.tools) args.push('--tools', kind.tools.join(','))
+      for (const s of w.skills ?? []) args.push('--skill', s.path) // -ns stops discovery only; explicit --skill paths still load
       const dict = await dictText(w.root)
       const jail = w.worktree ? `WORKTREE: your working directory is a private git worktree of ${w.root}. Use relative paths only. Never read or write under ${w.root} itself, even if the task text names it: that is the main checkout and other workers' merge target. Treat any such path in the task as the same path inside your working directory.` : ''
       // The toolbox goes to workers that can run commands: a file for bin/check and a section in the prompt.
@@ -1194,7 +1283,8 @@ export const register: Register = on => {
           toolbox = `TOOLBOX: the checks your supervisor expects you to run yourself in this project. Running them is allowed and safe: a [serial] check holds a lock shared with the other workers, so you never collide with them (you may wait a while for one to finish). These instructions replace any older dictionary note telling workers not to run these tools.\n${toolsText({ ...t, checks })}\nRun one with \`check <name>\` in bash (\`check all\` runs the required ones, \`check\` lists them). It runs from the project root with the right flags, keeps the full log in $TMPDIR and prints the verdict, the failed tests and error lines, and the log tail. Do not run the underlying command by hand.\n${req.length ? `REQUIRED for this task: ${req.map(n => `\`check ${n}\``).join(', ')}. Run them after your last edit and before your final report. If one fails because of your change, fix it and run it again. If it fails for a reason outside your change (another worker's file, an editor holding the project, a timeout), do not work around it: quote the error lines in your report.` : 'None is required for this task; run one when it is the quickest way to know your change works.'}`
         }
       }
-      const sys = [kind.role, jail, toolbox, dict].filter(Boolean).join('\n\n')
+      const skills = w.skills?.length ? `SKILLS: your supervisor attached these skills because this task is in their area. Before you write code in an area a skill covers, read its SKILL.md (and any reference files it points to) and follow its patterns:\n${skillsText(w.skills)}` : ''
+      const sys = [kind.role, jail, toolbox, skills, dict].filter(Boolean).join('\n\n')
       if (sys) args.push('--append-system-prompt', sys)
       if (w.session) args.push('--session', w.session)
       w.effortSent = w.effort ?? currentThinking
@@ -1272,7 +1362,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_spawn',
       description:
-        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers always use the model the user set with /pi-model (not selectable here). Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
@@ -1290,6 +1380,8 @@ export const register: Register = on => {
           fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
+          codex: { type: 'boolean', description: `Run this worker on Codex (the /codex-worker model, default ${CODEX_MODEL}, via the user's ChatGPT subscription) at the /codex-worker effort (default ${CODEX_THINKING}) instead of the /pi-model model; effort cannot be combined with it. Slower and stronger: use it for hard reasoning, tricky bugs and careful reviews, not routine edits.` },
+          skills: { type: 'array', items: { type: 'string' }, description: `Skills to push onto this worker, named as you know them (e.g. "godot-prompter:state-machine", a bare skill name, or a path to a skill dir). Pick the ones that match what the task touches: the worker reads them before working in that area. Max ${MAX_SKILLS}. From the project's .claude/skills, ~/.claude/skills and installed plugins.` },
           noDict: { type: 'boolean', description: 'Skip the project-dictionary requirement for a dev/general worker (the first one in a project is refused until pi_dict has entries).' },
           worktree: {
             type: 'boolean',
@@ -1383,6 +1475,7 @@ export const register: Register = on => {
           message: { type: 'string' },
           maxMinutes: { type: 'number', description: 'New time limit for this run (use it to give a worker that hit its limit more time).' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Change this worker\'s reasoning effort from this message on.' },
+          skills: { type: 'array', items: { type: 'string' }, description: 'More skills to push onto this worker (same naming as pi_spawn), when the follow-up moves into an area its current skills do not cover. Added to the ones it has.' },
         },
         ['id', 'message'],
       ),
@@ -1413,6 +1506,7 @@ export const register: Register = on => {
 
     await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
     await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
+    await $.command.register({ name: 'codex-worker', description: 'Show or change the Codex model and effort used by codex:true workers' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
     await $.command.register({ name: 'pi-setup', description: 'Install guide for omp-conductor and Pi, with a check of what this machine still needs' })
 
@@ -1490,6 +1584,52 @@ export const register: Register = on => {
     return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
   })
 
+  on('command.run', { command: 'codex-worker' }, async ($, e) => {
+    const [first = '', second = ''] = String((e as { args?: string }).args ?? '').trim().split(/\s+/)
+    const arg = first
+    const status = `codex worker: ${codexModel} at ${codexThinking}${codexModel === CODEX_MODEL && codexThinking === CODEX_THINKING ? ' (plugin default)' : ` (plugin default is ${CODEX_MODEL} at ${CODEX_THINKING})`}`
+    if (arg === 'list') {
+      const listed = await $.process.run(['pi', '--list-models', 'openai'], { env: { PI_CODING_AGENT_DIR: agentDir }, timeoutMs: 30_000 }).catch(() => undefined)
+      const names = listed && listed.exitCode === 0 ? listed.stdout.split('\n').map(l => l.trim().split(/\s+/)).filter(c => c[0] === 'openai').map(c => `  openai/${c[1]}`) : []
+      return { text: `${names.join('\n') || 'could not read the model list from pi'}\n${status}` }
+    }
+    if (!arg) {
+      return { text: `${status}\nChange it: /codex-worker <model or part of a name> [${THINKING_LEVELS.join('|')}]. Only the effort: /codex-worker <${THINKING_LEVELS.join('|')}>. Models: /codex-worker list. Reset: /codex-worker reset. Applies to codex:true workers spawned from now on; running and resumed workers keep theirs.` }
+    }
+    const saveBoth = async (m: string, t: string) => {
+      codexModel = m
+      codexThinking = t
+      await $.store.set('codexModel', m).catch(() => undefined)
+      await $.store.set('codexThinking', t).catch(() => undefined)
+    }
+    if (arg === 'reset' || arg === 'default') {
+      await saveBoth(CODEX_MODEL, CODEX_THINKING)
+      return { text: `codex worker reset to ${CODEX_MODEL} at ${CODEX_THINKING}.` }
+    }
+    if (second && !THINKING_LEVELS.includes(second.toLowerCase())) return { text: `unknown effort "${second}". Levels: ${THINKING_LEVELS.join(', ')}. ${status}` }
+    if (!second && THINKING_LEVELS.includes(arg.toLowerCase())) {
+      await saveBoth(codexModel, arg.toLowerCase())
+      return { text: `codex worker effort set to ${arg.toLowerCase()} (model ${codexModel}). Applies to codex workers spawned from now on.` }
+    }
+    const notReady = await ensureSetup()
+    if (notReady) return { text: notReady }
+    const query = arg.replace(/^openai\//, '')
+    const listed = await $.process.run(['pi', '--list-models', query], { env: { PI_CODING_AGENT_DIR: agentDir, OPENCODE_GO_API_KEY: apiKey }, timeoutMs: 30_000 }).catch(() => undefined)
+    if (!listed || listed.exitCode !== 0) return { text: `could not read the model list from pi. ${status}` }
+    const models = listed.stdout.split('\n').map(l => l.trim().split(/\s+/)).filter(c => c[0] === 'openai' && c.length >= 2).map(c => ({ selector: `openai/${c[1]}`, context: c[2] }))
+    const exact = models.filter(m => m.selector === `openai/${query}`)
+    const hits = exact.length ? exact : models
+    if (!hits.length) return { text: `no openai model matches "${arg}" (codex workers use Pi's openai provider). ${status}` }
+    if (hits.length > 1) {
+      const list = hits.slice(0, 15).map(m => `  ${m.selector}`).join('\n')
+      return { text: `${hits.length} models match "${arg}"; pass the exact name:\n${list}${hits.length > 15 ? '\n  …' : ''}\n${status}` }
+    }
+    const m = hits[0]!
+    await saveBoth(m.selector, second ? second.toLowerCase() : codexThinking)
+    const login = (await codexReady()) ? '' : `\n${CODEX_LOGIN}`
+    return { text: `codex worker set to ${codexModel} at ${codexThinking}${m.context ? ` (${m.context} context)` : ''}. Applies to codex:true workers spawned from now on; running and resumed workers keep theirs. Pi clamps effort to what the model supports.${login}` }
+  })
+
   on('command.run', { command: 'pi-setup' }, async $ => {
     // What this machine has: the guide plus a live checklist.
     const ver = async (argv: string[]) => {
@@ -1497,6 +1637,7 @@ export const register: Register = on => {
       return r && r.exitCode === 0 ? (r.stdout.trim() || r.stderr.trim()).split('\n')[0] : undefined
     }
     await ensureSetup()
+    const codexOk = await codexReady()
     const [node, git, pi, unity] = await Promise.all([ver(['node', '--version']), ver(['git', '--version']), ver(['pi', '--version']), ver(['unity', '--version'])])
     const [maj, min] = (node ?? '').replace(/^v/, '').split('.').map(Number)
     const nodeOk = !!node && (maj! > 22 || (maj === 22 && min! >= 19))
@@ -1506,6 +1647,7 @@ export const register: Register = on => {
       [!!pi, `Pi${pi ? ` (${pi})` : ' (not on PATH)'}`],
       [!!apiKey, `OpenCode Go key${apiKey ? '' : ` (none in ~/${AGENT_DIR_NAME}/env or the environment)`}`],
       [unity ? true : undefined, `Unity CLI (optional, Unity projects only)${unity ? '' : ': not installed'}`],
+      [codexOk || undefined, `ChatGPT sign-in for codex workers (optional)${codexOk ? '' : `: run \`PI_CODING_AGENT_DIR=~/${AGENT_DIR_NAME} pi\`, then /login → OpenAI`}`],
     ]
     const status = rows.map(([ok, label]) => `   ${ok === true ? '✔' : ok === false ? '✘' : '·'} ${label}`).join('\n')
     const ready = rows.slice(0, 4).every(([ok]) => ok)
@@ -1557,6 +1699,9 @@ export const register: Register = on => {
     const kind = AGENTS[agent]
     if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
     if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+    const codex = e.codex === true
+    if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
+    if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
     const dir = String(e.dir ?? cwd)
     if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
     if (!(await insideRoots(dir))) {
@@ -1577,6 +1722,19 @@ export const register: Register = on => {
       }
     }
     const projRoot = isGit ? top!.stdout.trim() : dir
+    let skills: Skill[] = []
+    if (Array.isArray(e.skills) && e.skills.length) {
+      const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
+      if (r.missing.length) {
+        seq -= 1
+        return text(unknownSkills(r.missing, r.catalog), true)
+      }
+      if (r.found.length > MAX_SKILLS) {
+        seq -= 1
+        return text(`${r.found.length} skills; push at most ${MAX_SKILLS} (the ones this task actually touches)`, true)
+      }
+      skills = r.found
+    }
     const tools = await loadTools($, projRoot, dir)
     let checks: string[] = []
     if (!kind.tools || kind.tools.includes('bash')) {
@@ -1630,7 +1788,9 @@ export const register: Register = on => {
       worktree,
       sub,
       branch,
-      model: currentModel,
+      model: codex ? codexModel : currentModel,
+      codex: codex || undefined,
+      skills: skills.length ? skills : undefined,
       agent,
       state: 'running',
       startedAt: Date.now(),
@@ -1655,7 +1815,7 @@ export const register: Register = on => {
       fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
       expect: Array.isArray(e.expect) ? (e.expect as unknown[]).map(String).filter(Boolean) : undefined,
       checks: checks.length ? checks : undefined,
-      effort: e.effort === undefined ? undefined : String(e.effort),
+      effort: codex ? codexThinking : e.effort === undefined ? undefined : String(e.effort),
       cost: 0,
       warn: [],
       tokensCache: 0,
@@ -1679,6 +1839,7 @@ export const register: Register = on => {
     const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
     return text(
       `started ${id} [${agent}] "${w.title}" in ${workDir(w)}` +
+        (skills.length ? `\nskills: ${skills.map(s => s.name).join(', ')}` : '') +
         (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
         (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
     )
@@ -1849,7 +2010,7 @@ export const register: Register = on => {
     return text(parts.join('\n\n'))
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__pi_send' }, async (_$, e) => {
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_send' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state === 'running') return text(`${w.id} is still running`, true)
@@ -1860,15 +2021,26 @@ export const register: Register = on => {
     const message = String(e.message ?? '').trim()
     if (!message) return text('message is required', true)
     if (typeof e.maxMinutes === 'number' && e.maxMinutes > 0) w.maxMinutes = Math.min(e.maxMinutes, 240)
+    if (w.codex && !w.send && !(await codexReady())) return text(CODEX_LOGIN, true)
     if (e.effort !== undefined) {
       if (!THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+      if (w.codex && String(e.effort) !== (w.effort ?? codexThinking)) return text(`${w.id} is a codex worker and always runs at ${w.effort ?? codexThinking}`, true)
       w.effort = String(e.effort)
+    }
+    // New skills: a live process gets them in the message (its system prompt is fixed); --skill carries them on restarts.
+    let added: Skill[] = []
+    if (Array.isArray(e.skills) && e.skills.length) {
+      const r = await resolveSkills($, home, w.root, (e.skills as unknown[]).map(String))
+      if (r.missing.length) return text(unknownSkills(r.missing, r.catalog), true)
+      added = r.found.filter(s => !(w.skills ?? []).some(h => h.path === s.path))
+      if ((w.skills?.length ?? 0) + added.length > MAX_SKILLS) return text(`${w.id} would have ${(w.skills?.length ?? 0) + added.length} skills; max ${MAX_SKILLS}`, true)
+      if (added.length) w.skills = [...(w.skills ?? []), ...added]
     }
     w.texts = []
     w.errors = []
-    B?.launch(w, message)
+    B?.launch(w, added.length && w.send ? `Your supervisor attached ${added.length === 1 ? 'a skill' : 'skills'} for this follow-up. Read each SKILL.md before you work in its area and follow its patterns:\n${skillsText(added)}\n\n${message}` : message)
     await sync()
-    return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}`)
+    return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}${added.length ? `; skills added: ${added.map(s => s.name).join(', ')}` : ''}`)
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_diff' }, async ($, e) => {

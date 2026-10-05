@@ -64,12 +64,20 @@ Pick `agent` on `pi_spawn` by what the worker may do:
    - Stuck or runaway: `pi_kill`.
 6. **Finish** by running the project's own tests in the merged repo yourself.
 
+## Skills (push what you know onto workers)
+
+Workers start with no skills. Pass `skills` on `pi_spawn` with the ones from your own skill list that match what the task touches, named as you know them (`godot-prompter:state-machine`, a bare name like `save-load`, or a path to a skill dir). Example: a worker writing a Godot enemy FSM gets `godot-prompter:state-machine` and `godot-prompter:ai-navigation`; one editing a Godot HUD gets `godot-prompter:hud-system` and `godot-prompter:godot-ui`. The worker's system prompt lists each one with its path and tells it to read the SKILL.md before working in that area; they stay attached across follow-ups and resumes.
+
+- Push only the skills the task needs (max 8): each one is a read the worker pays for. Workflow skills meant for you (orchestrate-pi, brainstorming, grill, mentor) are not for workers.
+- If a follow-up moves the worker into a new area, `pi_send` it with `skills` for that area; they are added to what it has.
+- An unknown name is refused with the closest matches; pick from those.
+
 ## Verification, time and warnings
 
 - **Tests**: put them in the toolbox (`pi_tools`) so workers run and fix them themselves. Use `verify` (with `fixRounds` 1–2) only for a final gate the worker must not run itself; the plugin runs it after the worker finishes, one at a time, and puts the result in the digest.
 - **`expect`**: list the files a task must change. A worker that finishes without touching them is flagged ⚠ in the digest and the wake-up message; a `NO FILES CHANGED` warning means the worker did nothing, whatever it reported.
 - **Time**: a timed-out worker reports what it finished. Read that report, then `pi_send` it (with `maxMinutes`) to continue instead of re-spawning.
-- **Hard tasks**: raise `effort` for that worker (`pi_spawn` or `pi_send`); the default is low.
+- **Hard tasks**: raise `effort` for that worker (`pi_spawn` or `pi_send`); the default is low. For the hardest ones (subtle bugs, tricky design, careful reviews) spawn with `codex: true`: that worker runs Codex (the model the user picked with `/codex-worker`, default `openai/gpt-6-luna`, on their ChatGPT subscription) at the `/codex-worker` effort (default xhigh). It is slower, so keep routine edits on the default model.
 - **Non-git directories** run in place. `pi_diff` still shows what each worker edited (against saved originals). Workers that share one compile unit will see each other's half-finished files: give them disjoint files and expect transient errors, or run them one after another.
 - `pi_wait` returns a one-line status for running workers; use `pi_digest` when you want the full picture of one.
 
@@ -81,4 +89,4 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 - `pi_merge` refuses while the main tree has tracked changes, and aborts cleanly on a conflict. On a conflict, `pi_send` the worker a request to rebase onto the current branch, or merge by hand.
 - `pi_cleanup` refuses to delete unmerged work unless `force` is true. Never force it without reading the diff.
 - A "worker finished" message from the plugin may arrive for a worker you already reviewed. Ignore it.
-- Every worker uses the one model the user chose with `/pi-model` (default `opencode-go/deepseek-v4.1-flash`) and the one reasoning effort set with `/pi-effort` (default low). You cannot choose a model or effort per task; if a task needs a stronger model or more reasoning, tell the user.
+- Every worker uses the one model the user chose with `/pi-model` (default `opencode-go/deepseek-v4.1-flash`) and the one reasoning effort set with `/pi-effort` (default low). The only per-task choices are `effort`, `skills` and `codex: true` (the `/codex-worker` model and effort). If `pi_spawn` says the ChatGPT sign-in is missing, pass its instructions to the user.

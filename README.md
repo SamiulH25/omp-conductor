@@ -29,11 +29,11 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-pi` skil
 
 | Tool | What it does |
 |---|---|
-| `pi_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`, `effort`, `verify`, `verifyTimeoutSec`, `fixRounds`, `expect`, `checks`, `noDict`). Returns an id at once. A `dev`/`general` worker is refused until the project has a dictionary (`pi_dict`), unless `noDict: true`. |
+| `pi_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`, `effort`, `verify`, `verifyTimeoutSec`, `fixRounds`, `expect`, `checks`, `skills`, `noDict`). Returns an id at once. `skills` pushes skills Claude has (project/user `.claude/skills` and installed plugins, e.g. `godot-prompter:state-machine`) onto the worker with Pi's `--skill`. A `dev`/`general` worker is refused until the project has a dictionary (`pi_dict`), unless `noDict: true`. |
 | `pi_status` | One line per worker, with live tok/s and cost, plus the session total. |
 | `pi_digest` | Compact report: files, commands, errors, git status, and the worker's own summary (when a worker gives none and its reply is long, Claude Haiku compresses it, labelled `summary (haiku)`). `detail: "full"` adds recent events. |
 | `pi_wait` | Wait up to 90 s. Finished workers get their full digest; workers still running get one line of what changed since the last wait (steps, files, current activity), never the same digest again. |
-| `pi_send` | Follow-up to a finished or timed-out worker (optional `maxMinutes`, `effort`). Goes to its live Pi process, so it keeps everything it learned; after 30 idle minutes the process is stopped and the saved session is resumed instead. Workers are RPC processes, so prefer sending a fix or the next task in the same area to an existing worker over spawning a new one: no re-reading, no re-learning the layout. |
+| `pi_send` | Follow-up to a finished or timed-out worker (optional `maxMinutes`, `effort`, `skills` to add more). Goes to its live Pi process, so it keeps everything it learned; after 30 idle minutes the process is stopped and the saved session is resumed instead. Workers are RPC processes, so prefer sending a fix or the next task in the same area to an existing worker over spawning a new one: no re-reading, no re-learning the layout. |
 | `pi_diff` | Review a worker's changes: `git diff` plus the content of new files for a worktree worker; for a worker with no worktree (non-git dir, or `worktree:false`) a diff of every file it edited against the original the guard saved, plus the other files changed since the spawn. |
 | `pi_merge` | Commit the worker's changes (never `__pycache__`/`.pyc`) and merge its branch `--no-ff`. On a conflict the main tree is left untouched and the same conflict is staged as markers in the worker's worktree, so you `pi_send` the worker to resolve it and `pi_merge` again; it refuses to commit while markers remain. |
 | `pi_cleanup` | Remove the worktree and branch and forget the worker; refuses unmerged work unless `force`. |
@@ -42,6 +42,8 @@ Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-pi` skil
 | `pi_kill` | Stop a worker and everything it started. |
 
 `/pi-model` shows the current worker model. `/pi-model <name>` switches it (a full `provider/model` selector or part of a name; it searches `pi --list-models`, and asks for the exact selector if several match). `/pi-model reset` restores the default. The choice is kept across sessions and applies to every worker started or resumed afterwards; running workers keep theirs.
+
+`/codex-worker` picks the model for `codex:true` workers: any `openai/*` model in Pi's catalog (ChatGPT sign-in). `/codex-worker` shows it, `/codex-worker list` lists models, `/codex-worker <name> [effort]` sets it (e.g. `/codex-worker gpt-5.3-codex high`), `/codex-worker <effort>` changes only the effort, `/codex-worker reset` restores GPT-6 Luna at xhigh. Applies to codex workers spawned afterwards; running workers keep theirs.
 
 `/pi-effort` shows the reasoning effort workers use. `/pi-effort <off|minimal|low|medium|high|xhigh|max>` switches it (Pi `--thinking` levels; Pi clamps to what the model supports). `/pi-effort reset` restores `low`. Kept across sessions and applied to workers started or resumed afterwards.
 
@@ -62,7 +64,7 @@ Detailed types (`explore`, `review`) show the whole report in `pi_digest` (a 600
 
 ## How it talks to Pi
 
-Each worker is one `pi --mode rpc --session-dir ~/.pi-workers/sessions --model <m> --thinking <effort> --offline -ne -ns -np -nc -na [--tools …] [--append-system-prompt <role + dictionary>]` process with `PI_CODING_AGENT_DIR=~/.pi-workers`. Extensions, skills, prompt templates, `AGENTS.md`/`CLAUDE.md` and project-local `.pi` files are all off, so a worker starts with only the short worker prompt, its tools and the dictionary.
+Each worker is one `pi --mode rpc --session-dir ~/.pi-workers/sessions --model <m> --thinking <effort> --offline -ne -ns -np -nc -na [--tools …] [--skill <dir> …] [--append-system-prompt <role + dictionary>]` process with `PI_CODING_AGENT_DIR=~/.pi-workers`. Extensions, skills, prompt templates, `AGENTS.md`/`CLAUDE.md` and project-local `.pi` files are all off, so a worker starts with only the short worker prompt, its tools, the dictionary and any skills the supervisor pushed (`--skill` paths still load with `-ns`).
 
 The plugin API can give a child process a fixed input but not a live stdin, so Pi's stdin is `tail -f` on a per-worker command file (`~/.pi-workers/run/`), and the plugin appends one JSON command per line (`prompt`, `get_state`, `abort`). `tail --pid` ties the pipe to the wrapper, so stopping a worker closes Pi's stdin and Pi shuts down by itself. The plugin reads the JSON event stream from stdout:
 
