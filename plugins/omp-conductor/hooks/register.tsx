@@ -306,6 +306,118 @@ const budgetThreshold = (cost: number, cap?: number): 'none' | 'warning' | 'exce
 const REPORT_CHARS = 60000 // a detailed report is shown whole; this is only a runaway guard (~15k tokens)
 const REPORT_CHARS_FULL = 200000 // ... with detail:"full", and the most the store keeps
 
+const workerPathKey = (w: any, sid: string) => w.pathKey ?? `${w.sessionId ?? sid}-${w.id}`
+const workerTmpDir = (agentDir: string, w: any, sid: string) => `${agentDir}/tmp/${workerPathKey(w, sid)}`
+const workerCommandFile = (agentDir: string, w: any, sid: string) => `${agentDir}/run/${workerPathKey(w, sid)}.jsonl`
+
+function serializeWorkerRecord(w: any, sessionId: string, detailed: boolean) {
+  const bounded = (value: unknown, max: number) => {
+    const text = String(value ?? '')
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text
+  }
+  return {
+    id: w.id,
+    title: bounded(w.title, 300),
+    task: bounded(w.task, w.state === 'queued' ? 200000 : 500),
+    after: w.after,
+    queuedReason: w.queuedReason,
+    dir: w.dir,
+    root: w.root,
+    isGit: w.isGit,
+    worktree: w.worktree,
+    sub: w.sub,
+    warn: (w.warn ?? []).slice(-30),
+    expect: w.expect,
+    checks: w.checks,
+    checkRuns: (w.checkRuns ?? []).slice(-12),
+    effort: w.effort,
+    codex: w.codex,
+    skills: w.skills,
+    owns: w.owns,
+    marker: w.marker,
+    snapDir: w.snapDir,
+    btwDir: w.btwDir,
+    btwAt: w.btwAt,
+    btwCount: w.btwCount,
+    tokensCache: w.tokensCache,
+    verify: w.verify,
+    verifyTimeout: w.verifyTimeout,
+    fixesLeft: w.fixesLeft,
+    verifyResult: w.verifyResult,
+    branch: w.branch,
+    session: w.session,
+    sessionId: w.sessionId ?? sessionId,
+    pathKey: w.pathKey,
+    model: w.model,
+    agent: w.agent,
+    state: w.state,
+    startedAt: w.startedAt,
+    endedAt: w.endedAt,
+    files: [...(w.files ?? [])].slice(-500),
+    reads: [...(w.reads ?? [])].slice(-200),
+    commands: (w.commands ?? []).slice(-10),
+    errors: (w.errors ?? []).slice(-10).map((x: unknown) => bounded(x, 1000)),
+    events: (w.events ?? []).slice(-300).map((x: unknown) => bounded(x, 200)),
+    eventTotal: w.eventTotal,
+    recentActivity: (w.recentActivity ?? []).slice(-24),
+    stuckKeys: (w.stuckKeys ?? []).slice(-32),
+    interruptedRun: bounded(w.interruptedRun, 500),
+    interruptedQueued: w.interruptedQueued,
+    last: bounded(w.last, 1000),
+    steps: w.steps,
+    tokensIn: w.tokensIn,
+    tokensOut: w.tokensOut,
+    finalText: bounded(w.texts?.at(-1) ?? '', detailed ? 200000 : 4000),
+    summary: bounded(w.summary, 4000),
+    outTokens: w.outTokens,
+    genMs: w.genMs,
+    spark: (w.spark ?? []).slice(-40),
+    maxMinutes: w.maxMinutes,
+    maxCost: w.maxCost,
+    budgetWarned: w.budgetWarned,
+    sessionBudgetWarned: w.sessionBudgetWarned,
+    cost: w.cost,
+  }
+}
+
+function restoreWorkerRecord(r: any, sessionId: string, now = Date.now()) {
+  const interrupted = r.state === 'running' || r.state === 'queued'
+  return {
+    ...r,
+    root: r.root ?? r.dir,
+    sessionId: r.sessionId ?? sessionId,
+    pathKey: r.pathKey ?? `${r.sessionId ?? sessionId}-${r.id}`,
+    agent: typeof r.agent === 'string' ? r.agent : 'general',
+    files: new Set(Array.isArray(r.files) ? r.files : []),
+    reads: new Set(Array.isArray(r.reads) ? r.reads : []),
+    texts: r.finalText ? [r.finalText] : [],
+    events: Array.isArray(r.events) ? r.events.slice(-300) : [],
+    eventTotal: r.eventTotal ?? r.events?.length ?? 0,
+    recentActivity: Array.isArray(r.recentActivity) ? r.recentActivity.slice(-24) : [],
+    stuckKeys: Array.isArray(r.stuckKeys) ? r.stuckKeys.slice(-32) : [],
+    stderr: '',
+    state: interrupted ? 'killed' : r.state,
+    last: interrupted ? 'restored; process stopped, session saved' : r.last,
+    endedAt: r.endedAt ?? (interrupted ? now : undefined),
+    interruptedQueued: r.interruptedQueued || r.state === 'queued',
+    restored: true,
+    isReported: true,
+    outTokens: r.outTokens ?? 0,
+    genMs: r.genMs ?? 0,
+    spark: Array.isArray(r.spark) ? r.spark.slice(-40) : [],
+    cost: r.cost ?? 0,
+    warn: Array.isArray(r.warn) ? r.warn.slice(-30) : [],
+    errors: Array.isArray(r.errors) ? r.errors.slice(-10) : [],
+    commands: Array.isArray(r.commands) ? r.commands.slice(-10) : [],
+    tokensCache: r.tokensCache ?? 0,
+    sawEnd: true,
+    turnChars: 0,
+    ratio: 0.28,
+    win: [],
+    toolArgs: {},
+  }
+}
+
 const workersAtom = atom({ plugin: 'omp-conductor', key: 'workers' } as const, [])
 const frameAtom = atom({ plugin: 'omp-conductor', key: 'frame' } as const, 0)
 const demoAtom = atom({ plugin: 'omp-conductor', key: 'demo' } as const, false)
@@ -321,6 +433,10 @@ type Worker = {
   id: string
   title: string
   task: string
+  sessionId?: string // Claude session that last owned this persisted worker
+  pathKey?: string // stable worker-specific key for agentDir scratch/run paths
+  restored?: boolean
+  interruptedQueued?: boolean
   after?: string[]
   queuedReason?: string
   dir: string
@@ -1046,7 +1162,7 @@ export const register: Register = on => {
 
     const q = (typeof question === 'string' ? question : '').trim().replace(/\s+/g, ' ') || DEFAULT_BTW_QUESTION
     const reqId = `${now.toString(36)}${(++btwSeq).toString(36)}`
-    const btwDir = (w.btwDir ??= `${agentDir}/run/${sid}-${w.id}.btw`)
+    const btwDir = (w.btwDir ??= `${agentDir}/run/${w.pathKey ?? `${w.sessionId ?? sid}-${w.id}`}.btw`)
     const file = `${btwDir}/${reqId}.json`
     const asked = Number(timeoutSec ?? 60)
     const waitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 60, 1), 90) * 1000
@@ -1181,100 +1297,37 @@ export const register: Register = on => {
     let lastSig = ''
     let verifyChain: Promise<unknown> = Promise.resolve() // verify commands run one at a time (a locked editor cannot run two)
     const storeKey = `${STORE_PREFIX}${await $.session.id()}`
-    const record = (w: Worker) => ({
-      id: w.id,
-      title: w.title,
-      task: clip(w.task, w.state === 'queued' ? REPORT_CHARS_FULL : 500),
-      after: w.after,
-      queuedReason: w.queuedReason,
-      dir: w.dir,
-      root: w.root,
-      isGit: w.isGit,
-      worktree: w.worktree,
-      sub: w.sub,
-      warn: w.warn,
-      expect: w.expect,
-      checks: w.checks,
-      checkRuns: w.checkRuns,
-      effort: w.effort,
-      codex: w.codex,
-      skills: w.skills,
-      owns: w.owns,
-      marker: w.marker,
-      snapDir: w.snapDir,
-      btwAt: w.btwAt,
-      btwCount: w.btwCount,
-      tokensCache: w.tokensCache,
-      verify: w.verify,
-      verifyResult: w.verifyResult,
-      branch: w.branch,
-      session: w.session,
-      model: w.model,
-      agent: w.agent,
-      state: w.state,
-      startedAt: w.startedAt,
-      endedAt: w.endedAt,
-      files: [...w.files],
-      reads: [...w.reads].slice(0, 200),
-      commands: w.commands.slice(-10),
-      errors: w.errors.slice(-5),
-      events: w.events,
-      eventTotal: w.eventTotal,
-      recentActivity: w.recentActivity,
-      stuckKeys: w.stuckKeys,
-      interruptedRun: w.interruptedRun,
-      last: w.last,
-      steps: w.steps,
-      tokensIn: w.tokensIn,
-      tokensOut: w.tokensOut,
-      finalText: clip(w.texts.at(-1) ?? '', AGENTS[w.agent]?.report === 'detailed' ? REPORT_CHARS_FULL : 4000),
-      summary: w.summary,
-      outTokens: w.outTokens,
-      genMs: w.genMs,
-      spark: w.spark,
-      maxMinutes: w.maxMinutes,
-      maxCost: w.maxCost,
-      cost: w.cost,
-    })
+    const registryFile = `${agentDir}/registry.json`
+    let registryWriteTimer: { cancel: () => void } | undefined
+    const record = (w: Worker) => serializeWorkerRecord(w, sid, AGENTS[w.agent]?.report === 'detailed')
 
-    // Bring back what an earlier load knew, so a reload keeps ids and sessions (pi_send still works).
-    const saved = (await $.store.get(storeKey).catch(() => undefined)) as
-      | { at: number; workers: ReturnType<typeof record>[] }
-      | undefined
-    if (saved && Array.isArray(saved.workers)) {
-      for (const r of saved.workers) {
-        const was = r.state === 'running'
-        workers.set(r.id, {
-          ...r,
-          root: r.root ?? r.dir,
-          agent: AGENTS[r.agent] ? r.agent : DEFAULT_AGENT,
-          files: new Set(r.files),
-          reads: new Set(r.reads ?? []),
-          texts: r.finalText ? [r.finalText] : [],
-          events: r.events ?? [],
-          eventTotal: r.eventTotal ?? r.events?.length ?? 0,
-          recentActivity: r.recentActivity ?? [],
-          stuckKeys: r.stuckKeys ?? [],
-          interruptedRun: r.interruptedRun,
-          stderr: '',
-          state: was ? 'killed' : r.state,
-          last: was ? 'interrupted by a reload' : r.last,
-          endedAt: r.endedAt ?? (was ? Date.now() : undefined),
-          isReported: true,
-          outTokens: r.outTokens ?? 0,
-          genMs: r.genMs ?? 0,
-          spark: r.spark ?? [],
-          cost: r.cost ?? 0,
-          warn: r.warn ?? [],
-          tokensCache: r.tokensCache ?? 0,
-          sawEnd: true,
-          turnChars: 0,
-          ratio: 0.28,
-          win: [],
-          toolArgs: {},
-        })
-        seq = Math.max(seq, Number(r.id.replace(/\D/g, '')) || 0)
+    // Load the machine-wide registry as well as the older per-session store. Session data wins on duplicate ids.
+    const saved = (await $.store.get(storeKey).catch(() => undefined)) as { at?: number; workers?: any[] } | undefined
+    const disk = await $.fs.read(registryFile).catch(() => undefined)
+    let registryWorkers: any[] = []
+    if (typeof disk === 'string') {
+      try {
+        const parsed = JSON.parse(disk)
+        if (Array.isArray(parsed?.workers)) registryWorkers = parsed.workers
+      } catch {
+        // Keep the session-scoped backup if the registry was interrupted while being written.
       }
+    }
+    const allSaved = new Map<string, any>()
+    for (const r of [...registryWorkers, ...(Array.isArray(saved?.workers) ? saved.workers : [])]) {
+      if (r && typeof r.id === 'string') allSaved.set(r.id, r)
+    }
+    for (const [id, r] of allSaved) {
+      const oldFinished = ['done', 'failed', 'killed'].includes(r.state) &&
+        !String(r.last ?? '').startsWith('restored;') && !String(r.last ?? '').startsWith('interrupted;')
+      if (r.worktree && oldFinished && Number(r.endedAt ?? r.startedAt ?? 0) < Date.now() - STALE_MS && !(await $.fs.exists(r.worktree).catch(() => false))) {
+        allSaved.delete(id)
+        continue
+      }
+      const restored = restoreWorkerRecord(r, sid)
+      restored.agent = AGENTS[restored.agent] ? restored.agent : DEFAULT_AGENT
+      workers.set(restored.id, restored as Worker)
+      seq = Math.max(seq, Number(restored.id.replace(/\D/g, '')) || 0)
     }
 
     // Housekeeping: drop the old machine-wide key and the records of long-dead sessions.
@@ -1289,6 +1342,22 @@ export const register: Register = on => {
         }
       }
     })()
+
+    const persistRegistry = async () => {
+      registryWriteTimer?.cancel()
+      registryWriteTimer = undefined
+      const temp = `${registryFile}.${sid}.tmp`
+      const body = JSON.stringify({ at: Date.now(), workers: [...workers.values()].map(record) })
+      await $.fs.write(temp, body).catch(() => undefined)
+      await $.process.run(['mv', '-f', temp, registryFile], { timeoutMs: 10_000 }).catch(() => undefined)
+    }
+    const scheduleRegistryWrite = () => {
+      if (registryWriteTimer) return
+      registryWriteTimer = $.clock.after(500, () => {
+        registryWriteTimer = undefined
+        void persistRegistry()
+      })
+    }
 
     // Project dictionary: the supervisor's own glossary of the project, injected into every worker's system prompt.
     type Dict = Record<string, { def: string; at: number }>
@@ -1371,12 +1440,12 @@ export const register: Register = on => {
 
       sync: async () => {
         const all0 = [...workers.values()]
-        const sig = all0.map(w => `${w.id}:${w.state}:${w.session ?? ''}:${w.files.size}:${w.steps}`).join(',')
+        const records = all0.map(record)
+        const sig = JSON.stringify(records)
         if (sig !== lastSig) {
           lastSig = sig
-          await $.store
-            .set(storeKey, { at: Date.now(), workers: all0.map(record) })
-            .catch(() => undefined)
+          await $.store.set(storeKey, { at: Date.now(), workers: records }).catch(() => undefined)
+          scheduleRegistryWrite()
         }
         await update($, workersAtom, () => views())
         const all = [...workers.values()]
@@ -1430,6 +1499,8 @@ export const register: Register = on => {
       // stays up, so a follow-up (pi_send) goes to a worker that still holds everything it learned.
       launch: (w, message) => {
         if (w.session) w.startedAt = Date.now()
+        w.restored = false
+        w.interruptedQueued = false
         w.state = 'running'
         w.endedAt = undefined
         w.stderr = ''
@@ -1616,7 +1687,8 @@ export const register: Register = on => {
       },
     }
 
-    const tmpDir = (w: Worker) => `${agentDir}/tmp/${sid}-${w.id}`
+    const workerKey = (w: Worker) => workerPathKey(w, sid)
+    const tmpDir = (w: Worker) => workerTmpDir(agentDir, w, sid)
     const childEnv = (w: Worker): Record<string, string> => ({
       PI_CODING_AGENT_DIR: agentDir,
       PI_BTW_DIR: w.btwDir!,
@@ -1630,7 +1702,7 @@ export const register: Register = on => {
       PI_CHECKS_FILE: `${tmpDir(w)}/checks.json`,
       PI_CHECKS_REQUIRED: (w.checks ?? []).join(','), // the guard asks for these after the last edit
     })
-    const cmdFile = (w: Worker) => `${agentDir}/run/${sid}-${w.id}.jsonl`
+    const cmdFile = (w: Worker) => workerCommandFile(agentDir, w, sid)
 
     // Starts the worker's `pi --mode rpc`. Pi reads commands from stdin and the plugin API can only give a child a fixed
     // input, so stdin is `tail -f` on a command file; --pid ends the tail (closing Pi's stdin, Pi's own shutdown) when
@@ -1638,7 +1710,7 @@ export const register: Register = on => {
     const startProc = async (w: Worker): Promise<boolean> => {
       const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
       const file = cmdFile(w)
-      w.btwDir = `${agentDir}/run/${sid}-${w.id}.btw`
+      w.btwDir ??= `${agentDir}/run/${workerKey(w)}.btw`
       await $.fs.write(file, '').catch(() => undefined)
       await $.fs.write(`${w.btwDir}/.keep`, '').catch(() => undefined)
       await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
@@ -1927,6 +1999,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
     await $.command.register({ name: 'pi-setup', description: 'Install guide for omp-conductor and Pi, with a check of what this machine still needs' })
 
+    await sync()
     scheduleQueue()
     $.clock.every(1000, () => {
       scheduleQueue()
@@ -1981,8 +2054,29 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.end', async (_$, e, next) => {
-    for (const w of workers.values()) w.stop?.()
+  on('session.end', async ($, e, next) => {
+    const now = Date.now()
+    for (const w of workers.values()) {
+      if (w.state !== 'running' && w.state !== 'queued') continue
+      w.killed = true
+      w.last = 'interrupted; session saved'
+      w.endedAt = now
+      if (w.state === 'queued') {
+        w.interruptedQueued = true
+        w.state = 'killed'
+      }
+    }
+    for (const w of workers.values()) {
+      if (w.state !== 'running') continue
+      w.stop?.()
+      if (w.state === 'running') w.state = 'killed'
+    }
+    await sync()
+    const registryFile = `${agentDir}/registry.json`
+    const temp = `${registryFile}.${sid}.tmp`
+    const records = [...workers.values()].map(w => serializeWorkerRecord(w, sid, AGENTS[w.agent]?.report === 'detailed'))
+    await $.fs.write(temp, JSON.stringify({ at: Date.now(), workers: records })).catch(() => undefined)
+    await $.process.run(['mv', '-f', temp, registryFile], { timeoutMs: 10_000 }).catch(() => undefined)
     return next(e)
   })
 
@@ -2300,6 +2394,8 @@ export const register: Register = on => {
       id,
       title: String(e.title ?? clip(one(task), 40)),
       task,
+      sessionId: sid,
+      pathKey: id,
       after: after.length ? after : undefined,
       queuedReason: after.some(dep => workers.get(dep)?.state !== 'done')
         ? `waiting for dependencies: ${after.filter(dep => workers.get(dep)?.state !== 'done').join(', ')}`
@@ -2351,8 +2447,8 @@ export const register: Register = on => {
     }
     // No worktree: remember when it started (to list what changed) and where the guard saves file originals (for pi_diff).
     if (!w.worktree) {
-      w.marker = `${agentDir}/run/${sid}-${w.id}.marker`
-      w.snapDir = `${agentDir}/snap/${sid}-${w.id}`
+      w.marker = `${agentDir}/run/${workerPathKey(w, sid)}.marker`
+      w.snapDir = `${agentDir}/snap/${workerPathKey(w, sid)}`
       await $.fs.write(w.marker, '').catch(() => undefined)
       await $.fs.write(`${w.snapDir}/manifest.jsonl`, '').catch(() => undefined)
     }
@@ -2490,7 +2586,12 @@ export const register: Register = on => {
           const position = w.state === 'queued' ? [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === w.id) + 1 : 0
           return `[${w.id}] ${w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length} ${clip(one(w.warn[0]!), 90)}` : ''} — ${w.title} — ${w.last}`
         })
-        .concat(`session total ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''} · ${led.spawned} spawned`)
+        .concat(
+          ...([...workers.values()].some(w => w.restored)
+            ? [`restored workers: ${[...workers.values()].filter(w => w.restored).map(w => w.id).join(', ')} · use pi_digest to review, pi_send to resume`]
+            : []),
+          `session total ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''} · ${led.spawned} spawned`,
+        )
         .join('\n'),
     )
   })
@@ -2582,7 +2683,10 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     const interrupt = e.interrupt === true
     if (w.state === 'running' && !interrupt) return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
-    if (!w.send && !w.session) return text(`${w.id} has no live process or session id to continue`, true)
+    if (!w.send && !w.session && !w.restored && !w.interruptedQueued) return text(`${w.id} has no live process or session id to continue`, true)
+    if (!w.send && !w.session && w.interruptedQueued && (w.after ?? []).some(id => workers.get(id)?.state !== 'done')) {
+      return text(`${w.id} was queued behind dependencies; finish ${w.after!.filter(id => workers.get(id)?.state !== 'done').join(', ')} before resuming it`, true)
+    }
     const notReady = await ensureSetup()
     if (notReady) return text(notReady, true)
     if (w.state !== 'running' && running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers; pi_send follow-ups are not queued (they resume an existing session), so wait for a slot and try again`, true)
@@ -2638,7 +2742,10 @@ export const register: Register = on => {
     }
     w.texts = []
     w.errors = []
-    B?.launch(w, added.length && w.send ? `Your supervisor attached ${added.length === 1 ? 'a skill' : 'skills'} for this follow-up. Read each SKILL.md before you work in its area and follow its patterns:\n${skillsText(added)}\n\n${message}` : message)
+    const prompt = !w.send && !w.session
+      ? `${w.interruptedQueued ? dependencyPrompt(w) : w.task}\n\nSupervisor follow-up: ${message}`
+      : message
+    B?.launch(w, added.length && w.send ? `Your supervisor attached ${added.length === 1 ? 'a skill' : 'skills'} for this follow-up. Read each SKILL.md before you work in its area and follow its patterns:\n${skillsText(added)}\n\n${message}` : prompt)
     await sync()
     return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}${added.length ? `; skills added: ${added.map(s => s.name).join(', ')}` : ''}`)
   })
@@ -2790,7 +2897,8 @@ export const register: Register = on => {
       await B.git(['branch', '-D', w.branch], w.dir)
     }
     w.stop?.()
-    await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${w.id}`, `${agentDir}/snap/${sid}-${w.id}`, `${agentDir}/run/${sid}-${w.id}.marker`, `${agentDir}/run/${sid}-${w.id}.btw`], { timeoutMs: 15_000 }).catch(() => undefined)
+    const leftovers = [workerTmpDir(agentDir, w, sid), w.snapDir, w.marker, w.btwDir, workerCommandFile(agentDir, w, sid)].filter((path): path is string => !!path)
+    await $.process.run(['rm', '-rf', ...leftovers], { timeoutMs: 15_000 }).catch(() => undefined)
     workers.delete(w.id)
     scheduleQueue()
     await sync()
