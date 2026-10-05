@@ -301,6 +301,20 @@ type ModelAgentType = (typeof AGENT_TYPES)[number]
 type ModelOverrides = Partial<Record<ModelAgentType, string>>
 const resolveWorkerModel = (agent: string, codex: boolean, codexModel: string, overrides: ModelOverrides, globalModel: string, pinnedCodexModel?: string) =>
   codex ? pinnedCodexModel ?? codexModel : overrides[agent as ModelAgentType] ?? globalModel
+
+function parseReviewFindings(report: string) {
+  const blocks = report.split(/\n\s*\n|\n(?=\s*(?:[-*+]|\d+[.)])\s)/)
+  return blocks.flatMap(block => {
+    const severity = block.match(/(?:\bseverity\s*[:*-]?\s*|\[\s*|\(\s*|^\s*(?:[-*+]\s*)?\*{0,2})(critical|blocker|high|medium|low)\b/i)?.[1]?.toLowerCase()
+    const location = block.match(/([A-Za-z0-9_./\\@-]+:\d+(?::\d+)?)/)?.[1]
+    if (!severity || !location) return []
+    return [{ severity, location, text: block.trim(), blocking: ['critical', 'blocker', 'high'].includes(severity) }]
+  })
+}
+
+function rankBestOfN(results: { id: string; passed: boolean; warnings: number; diffSize: number }[]) {
+  return [...results].sort((a, b) => Number(b.passed) - Number(a.passed) || a.warnings - b.warnings || a.diffSize - b.diffSize || a.id.localeCompare(b.id))
+}
 const budgetThreshold = (cost: number, cap?: number): 'none' | 'warning' | 'exceeded' =>
   !cap || cap <= 0 || cost <= 0 ? 'none' : cost >= cap ? 'exceeded' : cost >= cap * 0.8 ? 'warning' : 'none'
 const REPORT_CHARS = 60000 // a detailed report is shown whole; this is only a runaway guard (~15k tokens)
@@ -373,6 +387,13 @@ type Worker = {
   verifying?: boolean
   verifyDone?: boolean
   verifyResult?: { ok: boolean; exit: number; tail: string }
+  reviewBy?: { codex?: boolean; effort?: string }
+  reviewRoundsLeft?: number
+  reviewRoundsUsed?: number
+  reviewPending?: boolean
+  reviewDone?: boolean
+  reviewReport?: string
+  raceBatch?: string
   warn: string[] // things the supervisor must not miss: no changes made, expected files untouched, verify failed
   expect?: string[] // paths (relative to dir) the task must change
   checks?: string[] // toolbox checks this worker must run (and pass) after its last edit
@@ -417,6 +438,7 @@ type Bridge = {
   launch: (w: Worker, message: string) => void
   finished: (w: Worker) => Promise<void>
   verify: (w: Worker) => Promise<void>
+  review: (w: Worker) => Promise<void>
   changed: (w: Worker) => Promise<string[] | undefined>
   nonGitDiff: (w: Worker, cap: number) => Promise<string>
   summarize: (text: string) => Promise<string | undefined>
@@ -596,6 +618,8 @@ Optional
 export const register: Register = on => {
   const workers = new Map<string, Worker>()
   let B: Bridge | undefined
+  let spawnWorker: (($: any, e: Record<string, any>, options?: { model?: string; raceBatch?: string; onCreated?: (w: Worker) => void }) => Promise<any>) | undefined
+  let mergeChain: Promise<unknown> = Promise.resolve()
   let cwd = ''
   let home = ''
   let turnActive = false
@@ -616,6 +640,7 @@ export const register: Register = on => {
   let setupProblems: string[] = ['setup not checked yet']
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
   let seq = 0
+  let raceSeq = 0
   let btwSeq = 0
 
   const views = (): WorkerView[] =>
@@ -644,6 +669,7 @@ export const register: Register = on => {
     }))
 
   const running = () => [...workers.values()].filter(w => w.state === 'running').length
+  const isComplete = (w?: Worker) => w?.state === 'done' && !w.reviewPending
 
   const sync = () => B?.sync() ?? Promise.resolve()
 
@@ -668,10 +694,10 @@ export const register: Register = on => {
       changed = false
       for (const w of workers.values()) {
         if (w.state !== 'queued') continue
-        const waitingOn = (w.after ?? []).filter(id => workers.get(id)?.state !== 'done')
+        const waitingOn = (w.after ?? []).filter(id => !isComplete(workers.get(id)))
         w.queuedReason = waitingOn.length ? `waiting for dependencies: ${waitingOn.join(', ')}` : 'waiting for a worker slot'
         const bad = (w.after ?? []).map(id => ({ id, upstream: workers.get(id) })).find(({ upstream }) =>
-          !upstream || (upstream.state !== 'done' && upstream.state !== 'running' && upstream.state !== 'queued'),
+          !upstream || (!isComplete(upstream) && upstream.state !== 'running' && upstream.state !== 'queued' && !upstream.reviewPending),
         )
         if (bad) {
           const reason = `dependency ${bad.id} ${bad.upstream?.state ?? 'failed (cleaned up)'}`
@@ -686,7 +712,7 @@ export const register: Register = on => {
       }
       if (running() >= MAX_WORKERS) break
       const next = [...workers.values()].find(
-        w => w.state === 'queued' && (w.after ?? []).every(id => workers.get(id)?.state === 'done'),
+        w => w.state === 'queued' && (w.after ?? []).every(id => isComplete(workers.get(id))),
       )
       if (!next) break
       next.queuedReason = undefined
@@ -695,6 +721,80 @@ export const register: Register = on => {
       B.launch(next, dependencyPrompt(next))
       changed = true
     }
+  }
+
+  const runReview = async ($: any, w: Worker) => {
+    let reviewer: Worker | undefined
+    let fixPrompt: string | undefined
+    w.reviewRoundsUsed = (w.reviewRoundsUsed ?? 0) + 1
+    try {
+      if (!spawnWorker || !B) throw new Error('worker spawner is unavailable')
+      let diff = ''
+      if (w.worktree && w.branch) {
+        const target = await B.git(['rev-parse', 'HEAD'], w.dir)
+        const committed = target?.exitCode === 0 ? await B.git(['diff', '--no-ext-diff', `${target.stdout.trim()}...${w.branch}`], w.dir) : undefined
+        const uncommitted = await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w))
+        diff = [committed?.stdout, uncommitted?.stdout].filter(Boolean).join('\n')
+      } else if (w.isGit) {
+        diff = (await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w)))?.stdout ?? ''
+      } else {
+        diff = await B.nonGitDiff(w, 40_000)
+      }
+      if (!diff.trim()) throw new Error('could not collect a diff to review')
+      const config = w.reviewBy ?? {}
+      const prompt = `Review this worker's completed change. Original task:\n${w.task}\n\nDiff of the worker's worktree:\n${clip(diff, 60_000)}\n\nReport only actionable issues introduced by this diff, severity-ranked, with exact file:line references and a concrete failure scenario. Write each finding as one bullet formatted exactly "- [high] path/to/file:line — issue and failure scenario" (use medium or low where appropriate). Mark severity high only for blocking correctness/security/data-loss issues; list medium/low separately. If there are no blocking issues, explicitly say so. Do not edit files. End with your complete findings.`
+      let spawnResult: any
+      spawnResult = await spawnWorker($, {
+        task: prompt,
+        title: `review ${w.id}`,
+        dir: w.dir,
+        agent: 'review',
+        noDict: true,
+        worktree: false,
+        checks: [],
+        codex: config.codex === true,
+        ...(config.effort ? { effort: config.effort } : {}),
+      }, { onCreated: created => { reviewer = created } })
+      if (!reviewer) throw new Error(spawnResult?.deny ?? spawnResult?.result ?? 'reviewer could not be spawned')
+      await sync()
+      while (reviewer.state === 'running' || reviewer.state === 'queued') {
+        await $.process.run(['sleep', '1'], { timeoutMs: 3000 }).catch(() => undefined)
+      }
+      const report = reviewer.texts.at(-1)?.trim() || reviewer.runError || `reviewer ended ${reviewer.state} without a report`
+      w.reviewReport = [w.reviewReport, `Review round ${w.reviewRoundsUsed} (${reviewer.id}, ${reviewer.state}):\n${clip(report, 20_000)}`].filter(Boolean).join('\n\n')
+      if (reviewer.state !== 'done') throw new Error(`reviewer ${reviewer.id} ${reviewer.state}: ${reviewer.runError ?? reviewer.last}`)
+      const blocking = parseReviewFindings(report).filter(finding => finding.blocking)
+      if (blocking.length && (w.reviewRoundsLeft ?? 0) > 0) {
+        w.reviewRoundsLeft = (w.reviewRoundsLeft ?? 0) - 1
+        fixPrompt = `The code review found blocking issues. Fix these in your worktree, then stop and report. Do not ignore or weaken the findings.\n\n${blocking.map(finding => `[${finding.severity}] ${finding.location}: ${finding.text}`).join('\n\n')}`
+      } else if (blocking.length) {
+        w.warn.push(`review found ${blocking.length} blocking issue(s) after ${w.reviewRoundsUsed} review round(s); no fix rounds remain`)
+      }
+    } catch (err) {
+      const warning = `review failed; worker completed without review: ${clip(one(String((err as Error)?.message ?? err)), 300)}`
+      w.warn.push(warning)
+      w.reviewReport = [w.reviewReport, warning].filter(Boolean).join('\n\n')
+    } finally {
+      if (reviewer) {
+        reviewer.stop?.()
+        await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${reviewer.id}`, `${agentDir}/snap/${sid}-${reviewer.id}`, `${agentDir}/run/${sid}-${reviewer.id}.marker`, `${agentDir}/run/${sid}-${reviewer.id}.btw`, `${agentDir}/run/${sid}-${reviewer.id}.jsonl`], { timeoutMs: 15_000 }).catch(() => undefined)
+        workers.delete(reviewer.id)
+      }
+    }
+    if (fixPrompt) {
+      w.reviewPending = false
+      w.reviewDone = false
+      B?.launch(w, fixPrompt)
+      return
+    }
+    w.reviewPending = false
+    w.reviewDone = true
+    w.endedAt = Date.now()
+    scheduleQueue()
+    for (const settled of w.settleWaiters ?? []) settled()
+    w.settleWaiters = []
+    await B?.finished(w)
+    await sync()
   }
 
   // A run is over (Pi settled, the process died, it was killed or hit its time limit). The process may stay up.
@@ -718,6 +818,15 @@ export const register: Register = on => {
       w.act = 'bash'
       w.last = `verifying: ${clip(one(w.verify), 60)}`
       void B?.verify(w)
+      return
+    }
+    if (next === 'done' && !w.interrupting && w.reviewBy && !w.reviewDone) {
+      if (w.reviewPending) return
+      w.endedAt = Date.now()
+      w.state = 'done'
+      w.reviewPending = true
+      void B?.review(w)
+      void B?.syncSoon()
       return
     }
     w.endedAt = Date.now()
@@ -954,6 +1063,9 @@ export const register: Register = on => {
     lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}` + (w.owns !== undefined ? ` owns=${w.owns.join(', ') || '(none)'}` : ''))
     if (w.state === 'queued') lines.push(`queue: ${w.queuedReason ?? 'waiting for a worker slot'}`)
     if (w.after?.length) lines.push(`depends on: ${w.after.join(', ')}`)
+    if (w.reviewPending) lines.push(`review chain: reviewer running or queued; ${w.reviewRoundsUsed ?? 0} round(s) so far`)
+    if (w.reviewDone) lines.push(`review rounds: ${w.reviewRoundsUsed ?? 0}`)
+    if (w.reviewReport) lines.push(`review findings:\n${clip(w.reviewReport, full ? 20_000 : 5000)}`)
     lines.push(`dir: ${workDir(w)}${w.worktree ? ' (worktree)' : ''}`)
     if (w.interruptedRun) lines.push(`previous run interrupted: ${w.interruptedRun}`)
     const files = [...w.files]
@@ -1439,6 +1551,7 @@ export const register: Register = on => {
         w.timedOut = false
         w.verifying = false
         w.verifyDone = false
+        if (w.reviewBy) w.reviewDone = false
         w.runError = undefined
         w.warn = []
         const workerBudget = budgetThreshold(w.cost, w.maxCost)
@@ -1556,6 +1669,8 @@ export const register: Register = on => {
         const head = `${seen.size} file(s) edited with edit/write (new files are listed, existing ones diffed against the original)${others.length ? `; ${others.length} more changed by other means (shell), no baseline: ${others.slice(0, 20).join(', ')}${others.length > 20 ? ', …' : ''}` : ''}`
         return clip([head, ...parts].join('\n\n'), cap)
       },
+
+      review: w => runReview($, w),
 
       verify: async w => {
         const run = verifyChain.then(async () => {
@@ -1765,6 +1880,8 @@ export const register: Register = on => {
           verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Prefer toolbox checks (pi_tools), which the worker runs and fixes itself; use verify for a final gate the worker must not run. The result goes in the digest; a failure counts as a warning.' },
           verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
           fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
+          reviewBy: { oneOf: [{ type: 'boolean' }, obj({ codex: { type: 'boolean' }, effort: { type: 'string', enum: THINKING_LEVELS } })], description: 'Run a read-only review of the completed diff before the worker counts as done; blocking findings are sent back for fixes. Object optionally pins the reviewer to Codex or an effort.' },
+          reviewRounds: { type: 'number', description: 'With reviewBy: automatic review-fix rounds (0-2, default 1). The reviewer runs again after each fix.' },
           owns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns of files this worker may edit (relative to its dir/worktree root); use owned patterns so parallel workers avoid merge conflicts.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
@@ -1778,6 +1895,22 @@ export const register: Register = on => {
         },
         ['task'],
       ),
+    })
+    await $.tool.register({
+      name: 'pi_race',
+      description: 'Race 2-4 isolated workers on the same task. Optionally supply one model per worker; pi_wait ranks finished results by verification/checks, warnings, and diff size. Merge one winner and clean up the rest.',
+      inputSchema: obj({
+        task: { type: 'string', description: 'Complete standalone task shared by all contenders' },
+        n: { type: 'number', description: 'Number of contenders, 2-4' },
+        models: { type: 'array', items: { type: 'string' }, description: 'Optional exact model selector for each contender; must contain n entries.' },
+        dir: { type: 'string' }, title: { type: 'string' }, agent: { type: 'string', enum: Object.keys(AGENTS) },
+        after: { type: 'array', items: { type: 'string' } }, maxMinutes: { type: 'number' }, maxCost: { type: 'number' },
+        checks: { type: 'array', items: { type: 'string' } }, verify: { type: 'string' }, verifyTimeoutSec: { type: 'number' }, fixRounds: { type: 'number' },
+        reviewBy: { oneOf: [{ type: 'boolean' }, obj({ codex: { type: 'boolean' }, effort: { type: 'string', enum: THINKING_LEVELS } })] },
+        reviewRounds: { type: 'number' }, owns: { type: 'array', items: { type: 'string' } }, expect: { type: 'array', items: { type: 'string' } },
+        effort: { type: 'string', enum: THINKING_LEVELS }, codex: { type: 'boolean' }, skills: { type: 'array', items: { type: 'string' } },
+        noDict: { type: 'boolean' }, worktree: { type: 'boolean' },
+      }, ['task', 'n']),
     })
     await $.tool.register({
       name: 'pi_dict',
@@ -1909,8 +2042,8 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_merge',
       description:
-        "Commit a finished worker's worktree changes and merge its branch (--no-ff) into the repo it was spawned from. Refuses while the worker runs or the main tree has tracked changes; aborts and reports on conflict.",
-      inputSchema: obj({ ...idProp, message: { type: 'string', description: 'Merge commit message' } }, ['id']),
+        "Commit a finished worker's worktree changes and merge its branch (--no-ff) into the repo it was spawned from. Serializes merges, rebases a behind branch, and runs required checks after merge (reverts the merge commit on failure). Refuses tracked main-tree changes and reports conflicts.",
+      inputSchema: obj({ ...idProp, message: { type: 'string', description: 'Merge commit message' }, check: { type: 'boolean', description: 'Run required toolbox checks after merge; default true when required checks exist.' } }, ['id']),
     })
     await $.tool.register({
       name: 'pi_cleanup',
@@ -2183,7 +2316,7 @@ export const register: Register = on => {
     return { text: `${workers.size} worker(s), ${running()} running.` }
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__pi_spawn' }, async ($, e) => {
+  spawnWorker = async ($: any, e: Record<string, any>, options: { model?: string; raceBatch?: string; onCreated?: (w: Worker) => void } = {}) => {
     const notReady = await ensureSetup()
     if (notReady) return text(notReady, true)
     const task = String(e.task ?? '').trim()
@@ -2210,6 +2343,19 @@ export const register: Register = on => {
     const codex = e.codex === true
     if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
     if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
+    let reviewBy: Worker['reviewBy']
+    if (e.reviewBy === true) reviewBy = {}
+    else if (e.reviewBy && typeof e.reviewBy === 'object' && !Array.isArray(e.reviewBy)) {
+      const config = e.reviewBy as Record<string, unknown>
+      if (config.codex !== undefined && typeof config.codex !== 'boolean') return text('reviewBy.codex must be boolean', true)
+      if (config.effort !== undefined && !THINKING_LEVELS.includes(String(config.effort))) return text(`reviewBy.effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+      if (config.codex === true && config.effort !== undefined) return text('a Codex reviewer runs at the /codex-worker effort; drop reviewBy.effort', true)
+      reviewBy = { codex: config.codex === true, ...(config.effort !== undefined ? { effort: String(config.effort) } : {}) }
+    } else if (e.reviewBy !== undefined && e.reviewBy !== false) return text('reviewBy must be a boolean or {codex?, effort?}', true)
+    if (reviewBy && !['dev', 'general'].includes(agent)) return text('reviewBy is available only for dev/general workers', true)
+    if (reviewBy?.codex && !(await codexReady())) return text(CODEX_LOGIN, true)
+    if (e.reviewRounds !== undefined && (typeof e.reviewRounds !== 'number' || !Number.isInteger(e.reviewRounds) || e.reviewRounds < 0 || e.reviewRounds > 2)) return text('reviewRounds must be an integer from 0 to 2', true)
+    const reviewRoundsLeft = reviewBy ? (e.reviewRounds === undefined ? 1 : Number(e.reviewRounds)) : undefined
     const dir = String(e.dir ?? cwd)
     if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
     if (!(await insideRoots(dir))) {
@@ -2232,6 +2378,7 @@ export const register: Register = on => {
     const projRoot = isGit ? top!.stdout.trim() : dir
     if (owns?.length) {
       for (const other of workers.values()) {
+        if (options.raceBatch && other.raceBatch === options.raceBatch) continue
         if (other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
         const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
         if (overlap) {
@@ -2310,8 +2457,11 @@ export const register: Register = on => {
       worktree,
       sub,
       branch,
-      model: resolveWorkerModel(agent, codex, codexModel, modelOverrides, currentModel),
+      model: options.model ?? resolveWorkerModel(agent, codex, codexModel, modelOverrides, currentModel),
       codex: codex || undefined,
+      reviewBy,
+      reviewRoundsLeft,
+      raceBatch: options.raceBatch,
       skills: skills.length ? skills : undefined,
       owns,
       agent,
@@ -2357,6 +2507,7 @@ export const register: Register = on => {
       await $.fs.write(`${w.snapDir}/manifest.jsonl`, '').catch(() => undefined)
     }
     workers.set(id, w)
+    options.onCreated?.(w)
     void B?.ledger(0, 0, 1)
     scheduleQueue()
     await sync()
@@ -2373,6 +2524,32 @@ export const register: Register = on => {
         (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
         (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
     )
+  }
+
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_spawn' }, async ($, e) => spawnWorker!($, e))
+
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_race' }, async ($, e) => {
+    const n = Number(e.n)
+    if (!Number.isInteger(n) || n < 2 || n > 4) return text('n must be an integer from 2 to 4', true)
+    const task = String(e.task ?? '').trim()
+    if (!task) return text('task is required', true)
+    const models = e.models === undefined ? undefined : Array.isArray(e.models) ? (e.models as unknown[]).map(String).map(m => m.trim()) : null
+    if (models === null) return text('models must be an array of model selectors', true)
+    if (models && (models.length !== n || models.some(m => !m))) return text('models must contain exactly n non-empty model selectors', true)
+    if (models && e.codex === true) return text('models cannot be combined with codex:true', true)
+    const batch = `race-${Date.now().toString(36)}-${(++raceSeq).toString(36)}`
+    const spawned: Worker[] = []
+    for (let i = 0; i < n; i++) {
+      const options = { ...e, task, title: `${String(e.title ?? clip(one(task), 32))} (${i + 1}/${n})` }
+      const result = await spawnWorker!($, options, {
+        ...(models ? { model: models[i] } : {}),
+        raceBatch: batch,
+        onCreated: worker => spawned.push(worker),
+      })
+      if (spawned.length !== i + 1) return text(`race started ${spawned.length}/${n}: ${spawned.map(w => w.id).join(', ')}\n${result?.deny ?? result?.result ?? 'a contender could not be created'}`, true)
+    }
+    await sync()
+    return text(`started ${n}-worker race for "${clip(one(task), 80)}"\nworker ids: ${spawned.map(w => w.id).join(', ')}\nUse pi_wait with these ids; it will rank them when all finish.`)
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_dict' }, async ($, e) => {
@@ -2488,7 +2665,7 @@ export const register: Register = on => {
         .map(w => {
           const r = (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps
           const position = w.state === 'queued' ? [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === w.id) + 1 : 0
-          return `[${w.id}] ${w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length} ${clip(one(w.warn[0]!), 90)}` : ''} — ${w.title} — ${w.last}`
+          return `[${w.id}] ${w.reviewPending ? 'reviewing' : w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length} ${clip(one(w.warn[0]!), 90)}` : ''} — ${w.title} — ${w.last}`
         })
         .concat(`session total ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''} · ${led.spawned} spawned`)
         .join('\n'),
@@ -2498,7 +2675,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_digest' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state !== 'running' && w.state !== 'queued') w.isReported = true
+    if (w.state !== 'running' && w.state !== 'queued' && !w.reviewPending) w.isReported = true
     return text(await digest(w, e.detail === 'full'))
   })
 
@@ -2536,14 +2713,14 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_wait' }, async ($, e, next) => {
     const ids = Array.isArray(e.ids) && e.ids.length
       ? (e.ids as string[])
-      : [...workers.values()].filter(w => w.state === 'running' || w.state === 'queued').map(w => w.id)
+      : [...workers.values()].filter(w => w.state === 'running' || w.state === 'queued' || w.reviewPending || (w.raceBatch && !w.isReported)).map(w => w.id)
     const list = ids.map(i => workers.get(i)).filter((w): w is Worker => !!w)
     if (!list.length) return text('nothing to wait for')
     const limitMs = Math.min(Math.max(Number(e.timeoutSec ?? 60), 1), 90) * 1000
     const start = Date.now()
     const any = e.mode === 'any'
     for (;;) {
-      const done = list.filter(w => w.state !== 'running' && w.state !== 'queued')
+      const done = list.filter(w => w.state !== 'running' && w.state !== 'queued' && !w.reviewPending)
       if (any ? done.length > 0 : done.length === list.length) break
       if (Date.now() - start >= limitMs) break
       // $.clock.sleep would spend the hook's 10 s budget; a $ call in flight does not.
@@ -2552,9 +2729,13 @@ export const register: Register = on => {
     }
     const parts: string[] = []
     for (const w of list) {
-      if (w.state !== 'running' && w.state !== 'queued') {
+      if (w.state !== 'running' && w.state !== 'queued' && !w.reviewPending) {
         w.isReported = true
         parts.push(await digest(w))
+        continue
+      }
+      if (w.reviewPending) {
+        parts.push(`[${w.id}] review pending · ${w.reviewRoundsUsed ?? 0} round(s) · waiting for its read-only reviewer`)
         continue
       }
       if (w.state === 'queued') {
@@ -2572,8 +2753,35 @@ export const register: Register = on => {
       w.waitSteps = w.steps
       w.waitFiles = w.files.size
     }
-    const still = list.filter(w => w.state === 'running' || w.state === 'queued').length
-    if (still) parts.push(`(${still} still running or queued; call pi_wait again)`)
+    for (const batch of new Set(list.map(w => w.raceBatch).filter((id): id is string => !!id))) {
+      const members = [...workers.values()].filter(w => w.raceBatch === batch)
+      if (members.length < 2 || !members.every(isComplete)) continue
+      const ranked = [] as { id: string; passed: boolean; warnings: number; diffSize: number }[]
+      for (const w of members) {
+        const checksPassed = (w.checks ?? []).every(name => {
+          const run = w.checkRuns?.filter(check => check.name === name).at(-1)
+          return run?.ok === true
+        })
+        const passed = w.state === 'done' && (!w.verify || w.verifyResult?.ok === true) && checksPassed
+        let stat = ''
+        if (w.worktree && w.branch) {
+          const main = await B?.git(['rev-parse', 'HEAD'], w.dir)
+          if (main?.exitCode === 0) stat += (await B?.git(['diff', '--numstat', `${main.stdout.trim()}...${w.branch}`], w.dir))?.stdout ?? ''
+          stat += (await B?.git(['diff', '--numstat', 'HEAD'], workDir(w)))?.stdout ?? ''
+        } else if (w.isGit) stat = (await B?.git(['diff', '--numstat', 'HEAD'], workDir(w)))?.stdout ?? ''
+        const diffSize = stat.split('\n').reduce((sum, row) => {
+          const [added, removed] = row.split('\t')
+          return sum + (Number(added) || 0) + (Number(removed) || 0)
+        }, 0)
+        ranked.push({ id: w.id, passed, warnings: w.warn.length, diffSize })
+      }
+      const order = rankBestOfN(ranked)
+      const best = order[0]!
+      const why = `${best.passed ? 'verification/checks passed' : 'verification/checks not all passed'}, ${best.warnings} warning(s), ${best.diffSize} changed line(s)`
+      parts.push(`race ${batch} ranking (verification/checks, warnings, diff size): ${order.map((result, index) => `${index + 1}. ${result.id} [${result.passed ? 'passed' : 'not passed'}, ${result.warnings} warning(s), ${result.diffSize} lines]`).join('; ')}\nBest: ${best.id} — ${why}.`)
+    }
+    const still = list.filter(w => w.state === 'running' || w.state === 'queued' || w.reviewPending).length
+    if (still) parts.push(`(${still} still running, queued, or under review; call pi_wait again)`)
     return text(parts.join('\n\n'))
   })
 
@@ -2581,6 +2789,7 @@ export const register: Register = on => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
     const interrupt = e.interrupt === true
+    if (w.reviewPending) return text(`${w.id} is under review; wait for the review chain to finish before sending a follow-up`, true)
     if (w.state === 'running' && !interrupt) return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
     if (!w.send && !w.session) return text(`${w.id} has no live process or session id to continue`, true)
     const notReady = await ensureSetup()
@@ -2698,6 +2907,7 @@ export const register: Register = on => {
       void B?.finished(w)
       return text(`removed queued worker ${w.id}`)
     }
+    if (w.reviewPending) return text(`${w.id} is under review; wait for the review chain to finish before killing it`, true)
     if (w.state !== 'running') return text(`${w.id} is already ${w.state}`)
     w.killed = true
     void w.send?.({ type: 'abort' })
@@ -2706,68 +2916,124 @@ export const register: Register = on => {
     return text(`killed ${w.id}`)
   })
 
-  on('tool.call', { tool: 'mcp__omp-conductor__pi_merge' }, async (_$, e) => {
-    const w = pick(e)
-    if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state === 'queued') return text(`${w.id} is queued and has no work to merge yet`, true)
-    if (w.state === 'running') return text(`${w.id} is still running`, true)
-    if (!w.worktree || !w.branch) return text(`${w.id} has no worktree to merge`, true)
-    if (!B) return text('not ready', true)
-    const dirty = await B.git(['status', '--porcelain', '--untracked-files=no'], w.dir)
-    if (dirty?.stdout.trim()) {
-      return text(`main tree ${w.dir} has tracked changes; commit or stash them first`, true)
-    }
-    // Stage the worker's changes but never build junk: an untracked __pycache__ from running tests would otherwise
-    // be committed by every worker and conflict add/add at the second merge.
-    await B.git(['add', '-A', '--', '.', ':(exclude,glob)**/__pycache__/**', ':(exclude,glob)**/*.pyc', ':(exclude,glob)**/.DS_Store'], w.worktree)
-    // A conflict hand-off (below) leaves a merge in progress in the worktree; never commit it with markers still in files.
-    const markers = await B.git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>) ', '--', '.'], w.worktree)
-    if (markers?.exitCode === 0 && markers.stdout.trim()) {
-      return text(`${w.id} still has conflict markers (${markers.stdout.trim().split('\n').slice(0, 4).join('; ')}). pi_send it to resolve them, then pi_merge again.`, true)
-    }
-    const merging = (await B.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], w.worktree))?.exitCode === 0
-    const staged = await B.git(['diff', '--cached', '--quiet'], w.worktree)
-    if (staged?.exitCode === 1 || merging) {
-      const c = await B.git(
-        ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '--allow-empty', '-m', merging ? `Merge ${w.dir.split('/').pop()} into ${w.branch} (${w.id})` : `${w.title} (${w.id})`],
-        w.worktree,
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_merge' }, async ($, e) => {
+    if (e.check !== undefined && typeof e.check !== 'boolean') return text('check must be boolean', true)
+    const run = mergeChain.then(async () => {
+      const w = pick(e)
+      if (!w) return text(`no worker ${String(e.id)}`, true)
+      if (w.state === 'queued') return text(`${w.id} is queued and has no work to merge yet`, true)
+      if (w.state === 'running' || w.reviewPending) return text(`${w.id} is still running or under review`, true)
+      if (!w.worktree || !w.branch) return text(`${w.id} has no worktree to merge`, true)
+      if (!B) return text('not ready', true)
+      const dirty = await B.git(['status', '--porcelain', '--untracked-files=no'], w.dir)
+      if (dirty?.stdout.trim()) return text(`main tree ${w.dir} has tracked changes; commit or stash them first`, true)
+      // Stage only worker changes, excluding disposable test output.
+      await B.git(['add', '-A', '--', '.', ':(exclude,glob)**/__pycache__/**', ':(exclude,glob)**/*.pyc', ':(exclude,glob)**/.DS_Store'], w.worktree)
+      const markers = await B.git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>) ', '--', '.'], w.worktree)
+      if (markers?.exitCode === 0 && markers.stdout.trim()) {
+        return text(`${w.id} still has conflict markers (${markers.stdout.trim().split('\n').slice(0, 4).join('; ')}). pi_send it to resolve them, then pi_merge again.`, true)
+      }
+      const merging = (await B.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], w.worktree))?.exitCode === 0
+      const staged = await B.git(['diff', '--cached', '--quiet'], w.worktree)
+      if (staged?.exitCode === 1 || merging) {
+        const c = await B.git(
+          ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '--allow-empty', '-m', merging ? `Merge ${w.dir.split('/').pop()} into ${w.branch} (${w.id})` : `${w.title} (${w.id})`],
+          w.worktree,
+        )
+        if (c?.exitCode !== 0) return text(`commit failed: ${c?.stderr.trim() ?? 'unknown'}`, true)
+      }
+      const target = await B.git(['rev-parse', 'HEAD'], w.dir)
+      if (target?.exitCode !== 0) return text(`could not read target HEAD: ${target?.stderr.trim() ?? 'unknown'}`, true)
+      const targetSha = target.stdout.trim()
+      const ancestor = await B.git(['merge-base', '--is-ancestor', targetSha, w.branch], w.dir)
+      if (ancestor?.exitCode !== 0) {
+        const rebased = await B.git(['rebase', '--rebase-merges', targetSha], w.worktree)
+        if (rebased?.exitCode !== 0) {
+          await B.git(['rebase', '--abort'], w.worktree)
+          return text(`refusing to merge ${w.id}: its branch was behind/diverged from ${targetSha.slice(0, 12)} and rebase failed. Resolve in the worker worktree and retry.\n${clip(one(rebased?.stderr.trim() || rebased?.stdout.trim() || 'git rebase failed'), 1000)}`, true)
+        }
+      }
+      const ahead = await B.git(['rev-list', '--count', `${targetSha}..${w.branch}`], w.dir)
+      if (Number(ahead?.stdout.trim() ?? 0) === 0) return text(`${w.id}: nothing to merge`)
+      const msg = String(e.message ?? `omp merge ${w.id}: ${w.title}`)
+      const m = await B.git(
+        ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-ff', '-m', msg, w.branch],
+        w.dir,
       )
-      if (c?.exitCode !== 0) return text(`commit failed: ${c?.stderr.trim() ?? 'unknown'}`, true)
-    }
-    const ahead = await B.git(['rev-list', '--count', `HEAD..${w.branch}`], w.dir)
-    if (Number(ahead?.stdout.trim() ?? 0) === 0) return text(`${w.id}: nothing to merge`)
-    const msg = String(e.message ?? `omp merge ${w.id}: ${w.title}`)
-    const m = await B.git(
-      ['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-ff', '-m', msg, w.branch],
-      w.dir,
-    )
-    if (m?.exitCode !== 0) {
-      const files = await B.git(['diff', '--name-only', '--diff-filter=U'], w.dir)
-      const list = files?.stdout.trim().split('\n').join(', ') || m?.stderr.trim()
-      await B.git(['merge', '--abort'], w.dir)
-      // Hand the conflict to the worker: merge the main tree's current commit into its worktree, leaving markers
-      // for it to resolve. The main tree stays clean either way.
-      const head = (await B.git(['rev-parse', 'HEAD'], w.dir))?.stdout.trim()
-      const pre = head
-        ? await B.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-commit', '--no-ff', head], w.worktree)
-        : undefined
-      const handed = pre && pre.exitCode !== 0 && (await B.git(['diff', '--name-only', '--diff-filter=U'], w.worktree))?.stdout.trim()
-      return text(
-        `merge conflict, aborted; the main tree is untouched. conflicting: ${list}.` +
-          (handed
-            ? `\nThe same conflict is now in ${w.id}'s worktree as <<<<<<< markers (${handed.split('\n').join(', ')}). pi_send ${w.id}: "resolve the conflict markers in those files so both sides' intent is kept, edit files only (no git), run the tests, and report", wait, review pi_diff, then pi_merge ${w.id} again.`
-            : `\nCould not stage the conflict in the worktree; merge by hand or re-spawn on the current branch.`),
-        true,
-      )
-    }
-    const stat = await B.git(['diff', '--stat', 'HEAD~1', 'HEAD'], w.dir)
-    return text(`merged ${w.branch} into ${w.dir}\n${stat?.stdout.trim() ?? ''}`)
+      if (m?.exitCode !== 0) {
+        const files = await B.git(['diff', '--name-only', '--diff-filter=U'], w.dir)
+        const list = files?.stdout.trim().split('\n').join(', ') || m?.stderr.trim()
+        await B.git(['merge', '--abort'], w.dir)
+        const head = (await B.git(['rev-parse', 'HEAD'], w.dir))?.stdout.trim()
+        const pre = head
+          ? await B.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-commit', '--no-ff', head], w.worktree)
+          : undefined
+        const handed = pre && pre.exitCode !== 0 && (await B.git(['diff', '--name-only', '--diff-filter=U'], w.worktree))?.stdout.trim()
+        return text(
+          `merge conflict, aborted; the main tree is untouched. conflicting: ${list}.` +
+            (handed
+              ? `\nThe same conflict is now in ${w.id}'s worktree as <<<<<<< markers (${handed.split('\n').join(', ')}). pi_send ${w.id}: "resolve the conflict markers in those files so both sides' intent is kept, edit files only (no git), run the tests, and report", wait, review pi_diff, then pi_merge ${w.id} again.`
+              : `\nCould not stage the conflict in the worktree; merge by hand or re-spawn on the current branch.`),
+          true,
+        )
+      }
+      const merged = await B.git(['rev-parse', 'HEAD'], w.dir)
+      const mergeSha = merged?.stdout.trim()
+      if (!mergeSha) return text(`merge succeeded but could not read the merge commit: ${m.stdout.trim()}`)
+      const toolbox = await loadTools($, w.root, w.dir)
+      const required = Object.entries(toolbox.checks).filter(([, check]) => check.required).map(([name]) => name)
+      const shouldCheck = e.check !== false && required.length > 0
+      let checkOutput = ''
+      let failedCheck: { name: string; exit: number; tail: string } | undefined
+      const checkTmp = `${agentDir}/tmp/${sid}-${w.id}-merge-checks`
+      if (shouldCheck) {
+        await $.process.run(['mkdir', '-p', checkTmp], { timeoutMs: 10_000 }).catch(() => undefined)
+        const configured = Object.fromEntries(Object.entries(toolbox.checks).map(([name, check]) => [name, {
+          ...check,
+          lock: `${agentDir}/locks/${name}-${[...`${w.root}${toolbox.sub}`].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) >>> 0, 7).toString(36)}.lock`,
+        }]))
+        const checksFile = `${checkTmp}/checks.json`
+        await $.fs.write(checksFile, JSON.stringify({ cwd: `${w.root}${toolbox.sub}`, checks: configured }, null, 2))
+        for (const name of required) {
+          const check = toolbox.checks[name]!
+          const result = await $.process.run(['bash', '-c', `check ${name}`], {
+            cwd: `${w.root}${toolbox.sub}`,
+            env: {
+              PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`,
+              HOME: home,
+              PI_CODING_AGENT_DIR: agentDir,
+              PI_CHECKS_FILE: checksFile,
+              PI_CHECKS_REQUIRED: required.join(','),
+              TMPDIR: checkTmp,
+              ...(apiKey ? { OPENCODE_GO_API_KEY: apiKey } : {}),
+            },
+            timeoutMs: Math.min(3600, check.timeoutSec) * 1000,
+          }).catch(() => undefined)
+          const ok = result?.exitCode === 0
+          const tail = clip(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim().slice(-VERIFY_TAIL * 2), VERIFY_TAIL)
+          checkOutput += `\n${name}: ${ok ? 'PASS' : `FAIL (${result?.exitCode ?? 'could not start'})`}${tail ? `\n${tail}` : ''}`
+          if (!ok) { failedCheck = { name, exit: result?.exitCode ?? -1, tail }; break }
+        }
+        await $.process.run(['rm', '-rf', checkTmp], { timeoutMs: 10_000 }).catch(() => undefined)
+      }
+      if (failedCheck) {
+        const reverted = await B.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'revert', '--no-edit', '-m', '1', mergeSha], w.dir)
+        const rollback = reverted?.exitCode === 0
+          ? `merge ${mergeSha.slice(0, 12)} reverted as ${(await B.git(['rev-parse', '--short', 'HEAD'], w.dir))?.stdout.trim()}`
+          : `automatic revert failed; main tree may need manual recovery: ${clip(one(reverted?.stderr.trim() || reverted?.stdout.trim() || 'git revert failed'), 500)}`
+        return text(`post-merge check ${failedCheck.name} failed (exit ${failedCheck.exit}); ${rollback}. Output tail:\n${failedCheck.tail || checkOutput}`, true)
+      }
+      const stat = await B.git(['diff', '--stat', `${targetSha}..${mergeSha}`], w.dir)
+      return text(`merged ${w.branch} into ${w.dir}${shouldCheck ? `; required checks passed: ${required.join(', ')}` : ''}\n${stat?.stdout.trim() ?? ''}`)
+    })
+    mergeChain = run.then(() => undefined, () => undefined)
+    return await run
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_cleanup' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state === 'running') return text(`${w.id} is still running; pi_kill it first`, true)
+    if (w.state === 'running' || w.reviewPending) return text(`${w.id} is still running or under review; wait for it to finish before cleanup`, true)
     if (!B) return text('not ready', true)
     if (w.state === 'queued') {
       w.killed = true
