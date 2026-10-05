@@ -12,6 +12,7 @@ Workers (Pi, one long-lived `pi --mode rpc` process each) are cheap, parallel ha
 You are the judge and the planner. You write almost no code yourself: workers implement, you decide what is accepted.
 
 - **Do yourself**: decomposing, writing briefs, reading digests and diffs, merging, running the final tests, and quick fixes (a few lines, a typo, a one-file correction after review). A fix is quick when briefing a worker would cost more than making it.
+- **One manager per feature**: do not hand a whole feature to a plain worker (it grinds on it for too long). Spawn `agent: "manager"` with the feature; the manager splits it into slices, launches its own sub-workers, reviews and merges their work into its branch, runs the checks, and reports back to you. See "Manager workers" below.
 - **Delegate everything else**: every feature, refactor, investigation and test-writing task goes to a worker. If you catch yourself opening files to implement something, stop and spawn a worker instead.
 - **Fan out**: split the job into pieces on disjoint files and run them in parallel. For a big goal use `pi_plan` (a read-only planner returns a task DAG), review it, then `pi_spawn_plan`. For the same task over many targets use `pi_map`. For a hard problem where the approach is uncertain use `pi_race` (best-of-N) and merge the best.
 - **Gate with workers too**: add `reviewBy` so a reviewer worker checks each diff and sends blocking findings back for a fix round, instead of you reading every line. Still skim `pi_diff` for anything that matters.
@@ -29,6 +30,14 @@ You are the implementer. You write the code that needs your judgment, the design
 - Review what comes back like any other change: `pi_diff`, then `pi_merge` (it needs a clean main tree, so commit or stash your own tracked edits first).
 
 Everything below applies to both modes.
+
+## Manager workers (sub-orchestrators)
+
+- `pi_spawn { agent: "manager", task: <the feature>, maxSubWorkers?, maxCost? }`. A manager has no edit tools: it can only read, run commands and launch sub-workers (`sub_spawn`, `sub_wait`, `sub_diff`, `sub_merge`, `sub_send`, ...). It works in its own worktree, which is the integration branch for the feature.
+- **You talk only to your direct children**: managers and any plain workers you launched yourself. A manager's sub-workers show indented under it in `pi_status`, but calling `pi_digest`/`pi_send`/`pi_merge`... on one is refused ("belongs to manager wN"). Plain workers and sub-workers can never launch workers; only managers can, one level deep.
+- **Approval**: when the manager finishes, it reports with a rollup of its sub-workers. Review it like any worker: `pi_digest`, `pi_diff` of the integration branch, then `pi_merge` to approve, or `pi_send` corrections (the manager keeps its context and sub-workers). A budget (`maxCost`) covers the whole tree.
+- Write the manager brief as the feature spec: goal, acceptance checks, constraints, files that are out of bounds. Do not decompose it for the manager; that is its job. Use a plain worker only for a small, single-slice task.
+- If a manager looks stuck, `pi_btw` it; `pi_kill` or `pi_cleanup` on a manager also stops or removes its sub-workers.
 
 ## Reuse workers: they are RPC processes, not one-shot calls
 
