@@ -16,6 +16,7 @@ const DENY = /\/\.(ssh|gnupg|aws|kube|docker)(\/|$)/
 const SUMMARY_MODEL = 'haiku' // the one other model: compresses a long worker reply that has no SUMMARY block
 const DEFAULT_MODEL = 'opencode-go/deepseek-v4.1-flash'
 const DEFAULT_THINKING = 'low' // reasoning effort workers start with; /pi-effort changes it
+const DEFAULT_BTW_QUESTION = 'What exactly are you doing right now, why is it taking this long, what is left, and are you stuck?'
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] // pi --thinking values
 // pi_spawn codex:true pins a worker to Codex (default GPT-6 Luna, any openai/* model via /codex-worker) through the ChatGPT sign-in of Pi's `openai` provider, at xhigh.
 const CODEX_MODEL = 'openai/gpt-6-luna' // default; /codex-worker changes it to any openai/* model
@@ -276,6 +277,13 @@ type Worker = {
   skills?: Skill[] // skills the supervisor pushed (pi_spawn / pi_send): --skill on every process start
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
   snapDir?: string // non-git dirs: originals of files the worker edited (written by the guard extension)
+  btwDir?: string
+  btwAt?: number
+  btwCount?: number
+  btwPending?: string
+  btwResponse?: { id: string; disposition: string }
+  btwNextRun?: 'started' | 'queued'
+  btwIgnoringRun?: boolean
   tokensCache: number
   waitSteps?: number // pi_wait reports running workers as deltas against these
   waitFiles?: number
@@ -495,6 +503,7 @@ export const register: Register = on => {
   let setupProblems: string[] = ['setup not checked yet']
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
   let seq = 0
+  let btwSeq = 0
 
   const views = (): WorkerView[] =>
     [...workers.values()].map(w => ({
@@ -599,6 +608,28 @@ export const register: Register = on => {
       // Pi prints plain-text errors (unknown model, bad flag) outside the JSON stream.
       w.stderr = (w.stderr + raw + '\n').slice(-2000)
       note(w, `raw: ${raw}`)
+      return
+    }
+    if (ev.type === 'response' && ev.command === 'prompt' && w.btwPending) {
+      const disposition = String(ev.data?.disposition ?? ev.disposition ?? '')
+      if (disposition) {
+        w.btwResponse = { id: w.btwPending, disposition }
+        if (disposition === 'started' || disposition === 'queued') {
+          w.btwNextRun = disposition
+          if (disposition === 'started') void w.send?.({ type: 'abort' })
+        }
+      } else if (ev.success === false) w.btwResponse = { id: w.btwPending, disposition: 'error' }
+      return
+    }
+    if (w.btwIgnoringRun) {
+      if (ev.type === 'agent_settled') w.btwIgnoringRun = false
+      return
+    }
+    if (ev.type === 'turn_start' && w.btwNextRun) {
+      const fallback = w.btwNextRun
+      w.btwNextRun = undefined
+      w.btwIgnoringRun = true
+      if (fallback === 'queued') void w.send?.({ type: 'abort' })
       return
     }
     w.lastAt = Date.now()
@@ -811,6 +842,73 @@ export const register: Register = on => {
     return workers.get(id)
   }
 
+  const askBtw = async ($: any, id: string, question: unknown, timeoutSec: unknown, force: unknown) => {
+    const reply = (message: string, error = false) => ({ message, error })
+    const w = workers.get(id)
+    if (!w) return reply(`no worker ${id}`, true)
+    if (w.state !== 'running') return reply(`${id} is ${w.state}; pi_btw only works on a running worker. Use pi_digest for its result or pi_send to continue it.`, true)
+    if (!w.send) return reply(`${id} has no live Pi process; use pi_digest to read its result or pi_send to resume it.`, true)
+    if (w.btwPending) return reply(`${id} already has a btw request in progress; wait for it to finish.`, true)
+
+    const now = Date.now()
+    if (force !== true) {
+      if ((w.btwCount ?? 0) >= 5) return reply(`${id} has reached the limit of 5 btw calls; pass force:true to override.`, true)
+      if (w.btwAt && now - w.btwAt < 30_000) {
+        const left = Math.ceil((30_000 - (now - w.btwAt)) / 1000)
+        return reply(`${id} was asked recently; wait ${left}s before the next btw call or pass force:true.`, true)
+      }
+    }
+
+    const q = (typeof question === 'string' ? question : '').trim().replace(/\s+/g, ' ') || DEFAULT_BTW_QUESTION
+    const reqId = `${now.toString(36)}${(++btwSeq).toString(36)}`
+    const btwDir = (w.btwDir ??= `${agentDir}/run/${sid}-${w.id}.btw`)
+    const file = `${btwDir}/${reqId}.json`
+    const asked = Number(timeoutSec ?? 60)
+    const waitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 60, 1), 90) * 1000
+    const deadline = Date.now() + waitMs
+    w.btwAt = now
+    w.btwCount = (w.btwCount ?? 0) + 1
+    w.btwPending = reqId
+    w.btwResponse = undefined
+    void B?.sync()
+
+    const context = () => {
+      const quiet = w.lastAt ? ` · last event ${Math.round((Date.now() - w.lastAt) / 1000)}s ago` : ''
+      return `[${w.id}] ${w.state} · elapsed ${elapsed(w)} · last activity: ${w.last || 'none'}${quiet}`
+    }
+    try {
+      await $.fs.write(`${btwDir}/.keep`, '').catch(() => undefined)
+      await w.send({ type: 'prompt', message: `/btw ${reqId} ${q}` })
+      for (;;) {
+        const response = w.btwResponse
+        if (response?.id === reqId && response.disposition !== 'handled') {
+          return reply('btw unavailable on this worker (extension not loaded)', true)
+        }
+        const raw = await $.fs.read(file).catch(() => undefined)
+        if (typeof raw === 'string' && raw.trim()) {
+          let data: any
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
+          }
+          if (data?.id === reqId) {
+            if (typeof data.error === 'string') return reply(`${context()}\n${data.error}`, true)
+            if (typeof data.a === 'string') return reply(`${context()}\n${data.a}`)
+            return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
+          }
+        }
+        if (Date.now() >= deadline) return reply(`${context()}\nbtw timed out after ${Math.round(waitMs / 1000)}s.`, true)
+        await new Promise<void>(resolve => $.clock.after(Math.min(500, deadline - Date.now()), resolve))
+      }
+    } catch (err) {
+      return reply(`${context()}\nbtw failed: ${String(err)}`, true)
+    } finally {
+      if (w.btwPending === reqId) w.btwPending = undefined
+      if (w.btwResponse?.id === reqId) w.btwResponse = undefined
+    }
+  }
+
   const toolsText = (t: Toolbox) =>
     Object.entries(t.checks)
       .map(([n, c]) => `- ${n}${c.required ? ' (required)' : ''}${c.serial ? ' [serial]' : ''}: ${c.purpose}\n    runs: ${c.command}`)
@@ -911,6 +1009,8 @@ export const register: Register = on => {
       skills: w.skills,
       marker: w.marker,
       snapDir: w.snapDir,
+      btwAt: w.btwAt,
+      btwCount: w.btwCount,
       tokensCache: w.tokensCache,
       verify: w.verify,
       verifyResult: w.verifyResult,
@@ -1240,6 +1340,7 @@ export const register: Register = on => {
     const tmpDir = (w: Worker) => `${agentDir}/tmp/${sid}-${w.id}`
     const childEnv = (w: Worker): Record<string, string> => ({
       PI_CODING_AGENT_DIR: agentDir,
+      PI_BTW_DIR: w.btwDir!,
       OPENCODE_GO_API_KEY: apiKey,
       PYTHONDONTWRITEBYTECODE: '1',
       TMPDIR: tmpDir(w), // scratch files stay out of the project and out of /tmp
@@ -1257,7 +1358,9 @@ export const register: Register = on => {
     const startProc = async (w: Worker): Promise<boolean> => {
       const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
       const file = cmdFile(w)
+      w.btwDir = `${agentDir}/run/${sid}-${w.id}.btw`
       await $.fs.write(file, '').catch(() => undefined)
+      await $.fs.write(`${w.btwDir}/.keep`, '').catch(() => undefined)
       await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
       w.model = w.codex ? w.model || codexModel : currentModel
       const args = [
@@ -1265,6 +1368,8 @@ export const register: Register = on => {
         '--offline', '-ne', '-ns', '-np', '-nc', '-na',
       ]
       args.push('-e', `${$.plugin.root}/extensions/guard.ts`)
+      const btwExtension = `${$.plugin.root}/extensions/btw.ts`
+      if (await $.fs.exists(btwExtension).catch(() => false)) args.push('-e', btwExtension)
       if (kind.tools) args.push('--tools', kind.tools.join(','))
       for (const s of w.skills ?? []) args.push('--skill', s.path) // -ns stops discovery only; explicit --skill paths still load
       const dict = await dictText(w.root)
@@ -1466,6 +1571,19 @@ export const register: Register = on => {
       }),
     })
     await $.tool.register({
+      name: 'pi_btw',
+      description: 'Ask a running worker why it is taking a long time or has gone quiet, without interrupting it. Use this before killing or steering a slow worker.',
+      inputSchema: obj(
+        {
+          ...idProp,
+          question: { type: 'string', description: `Question to ask (default: ${DEFAULT_BTW_QUESTION})` },
+          timeoutSec: { type: 'number', description: 'Wait for the answer (default 60 seconds, max 90).' },
+          force: { type: 'boolean', description: 'Bypass the per-worker rate and total limits.' },
+        },
+        ['id'],
+      ),
+    })
+    await $.tool.register({
       name: 'pi_send',
       description:
         'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes and for the next task in the same area instead of re-spawning (no re-reading, no re-learning the layout). Send only the new instruction; it already has the background. The worker must not be running.',
@@ -1507,6 +1625,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
     await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
     await $.command.register({ name: 'codex-worker', description: 'Show or change the Codex model and effort used by codex:true workers' })
+    await $.command.register({ name: 'btw', description: 'Ask a running worker why it is slow or quiet without interrupting it' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
     await $.command.register({ name: 'pi-setup', description: 'Install guide for omp-conductor and Pi, with a check of what this machine still needs' })
 
@@ -1582,6 +1701,13 @@ export const register: Register = on => {
     const m = hits[0]!
     await set(m.selector)
     return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
+  })
+
+  on('command.run', { command: 'btw' }, async ($, e) => {
+    const [id = '', ...question] = String((e as { args?: string }).args ?? '').trim().split(/\s+/)
+    if (!id) return { text: 'usage: /btw <id> [question]' }
+    const result = await askBtw($, id, question.join(' '), 60, false)
+    return { text: result.message }
   })
 
   on('command.run', { command: 'codex-worker' }, async ($, e) => {
@@ -1971,6 +2097,11 @@ export const register: Register = on => {
     return text(await digest(w, e.detail === 'full'))
   })
 
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_btw' }, async ($, e) => {
+    const result = await askBtw($, String(e.id ?? ''), e.question, e.timeoutSec, e.force)
+    return text(result.message, result.error)
+  })
+
   on('tool.call', { tool: 'mcp__omp-conductor__pi_wait' }, async ($, e, next) => {
     const ids = Array.isArray(e.ids) && e.ids.length
       ? (e.ids as string[])
@@ -2161,7 +2292,7 @@ export const register: Register = on => {
       await B.git(['branch', '-D', w.branch], w.dir)
     }
     w.stop?.()
-    await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${w.id}`, `${agentDir}/snap/${sid}-${w.id}`, `${agentDir}/run/${sid}-${w.id}.marker`], { timeoutMs: 15_000 }).catch(() => undefined)
+    await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${w.id}`, `${agentDir}/snap/${sid}-${w.id}`, `${agentDir}/run/${sid}-${w.id}.marker`, `${agentDir}/run/${sid}-${w.id}.btw`], { timeoutMs: 15_000 }).catch(() => undefined)
     workers.delete(w.id)
     await sync()
     return text(`cleaned up ${w.id}`)
