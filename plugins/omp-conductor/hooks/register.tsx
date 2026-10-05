@@ -880,7 +880,7 @@ export const register: Register = on => {
       await $.fs.write(`${btwDir}/.keep`, '').catch(() => undefined)
       await w.send({ type: 'prompt', message: `/btw ${reqId} ${q}` })
       for (;;) {
-        const response = w.btwResponse
+        const response = w.btwResponse as Worker['btwResponse'] // set by the event handler while we poll
         if (response?.id === reqId && response.disposition !== 'handled') {
           return reply('btw unavailable on this worker (extension not loaded)', true)
         }
@@ -905,7 +905,7 @@ export const register: Register = on => {
       return reply(`${context()}\nbtw failed: ${String(err)}`, true)
     } finally {
       if (w.btwPending === reqId) w.btwPending = undefined
-      if (w.btwResponse?.id === reqId) w.btwResponse = undefined
+      if ((w.btwResponse as Worker['btwResponse'])?.id === reqId) w.btwResponse = undefined
     }
   }
 
