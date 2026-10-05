@@ -9,6 +9,8 @@
 //    redirected into the worker's own worktree, so a brief that names the main repo's absolute path cannot make the
 //    worker edit the main tree.
 // 6. Once per run: if the task asked for a SUMMARY:/FINDINGS: block and the final reply lacks it, asks for it.
+// 7. PI_CHECKS_REQUIRED (toolbox checks run with the plugin's `check` command): once per run, if files were changed and
+//    a required check was not run after the last change, asks for exactly those `check <name>` runs before the report.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -24,6 +26,12 @@ export default function (pi: ExtensionAPI) {
 	let taskText = "";
 	let nudgedVerify = false;
 	let nudgedReport = false;
+	let nudgedChecks = false;
+	const required = (process.env.PI_CHECKS_REQUIRED ?? "").split(",").filter(Boolean);
+	const checkedAt = new Map<string, number>(); // check name -> edit counter when it was last run
+	let edits = 0; // edit/write calls this run
+	let lastEdit = 0;
+	const CHECK_RE = /(?:^|[\s;&|(])check\s+([\w.-]+)/g;
 
 	const sig = (p: string) => {
 		try {
@@ -64,7 +72,11 @@ export default function (pi: ExtensionAPI) {
 		taskText = prompt;
 		nudgedVerify = false;
 		nudgedReport = false;
+		nudgedChecks = false;
 		edited = false;
+		edits = 0;
+		lastEdit = 0;
+		checkedAt.clear();
 	});
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
@@ -124,9 +136,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			mutations++;
 			edited = true;
+			lastEdit = ++edits;
 		} else if (name === "bash") {
 			mutations++;
 			edited = false; // something was run after the last change
+			if (typeof input.command === "string") {
+				for (const m of input.command.matchAll(CHECK_RE)) {
+					for (const n of m[1] === "all" ? required : [m[1]]) checkedAt.set(n, edits);
+				}
+			}
 		}
 		return undefined;
 	});
@@ -143,6 +161,13 @@ export default function (pi: ExtensionAPI) {
 		const last = [...msgs].reverse().find((m) => m.role === "assistant");
 		if (!last || last.stopReason === "error" || last.stopReason === "aborted") return;
 		const text = (last.content ?? []).filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n");
+		const stale = required.filter((n) => (checkedAt.get(n) ?? -1) < lastEdit);
+		if (edits > 0 && stale.length && !nudgedChecks) {
+			nudgedChecks = true;
+			nudgedVerify = true; // this is the verify request, with the exact commands
+			pi.sendUserMessage(`${MARK} Your supervisor requires these toolbox checks after your last edit, and they have not run since: ${stale.map((n) => `\`check ${n}\``).join(", ")}. Run them now (they are allowed and lock-safe with other workers), fix what your change broke, then give your final report. If one cannot run, quote its error lines in the report.`, { deliverAs: "followUp" });
+			return;
+		}
 		if (edited && !nudgedVerify) {
 			nudgedVerify = true;
 			pi.sendUserMessage(`${MARK} You changed files but ran nothing afterwards. Run the check the task names (or the project's tests) now, fix anything it shows, then give your final report. If no check exists, say so.`, { deliverAs: "followUp" });

@@ -1,11 +1,20 @@
 ---
 name: orchestrate-pi
-description: Use when a task splits into independent pieces that Pi workers can do in parallel (pi_spawn, pi_wait, pi_digest, pi_diff, pi_merge, pi_cleanup). Covers briefing workers, reviewing real diffs instead of summaries, and merging.
+description: Use when a task splits into independent pieces that Pi workers can do in parallel (pi_spawn, pi_tools, pi_wait, pi_digest, pi_diff, pi_merge, pi_cleanup). Covers briefing workers, the checks workers run themselves, reviewing real diffs instead of summaries, and merging.
 ---
 
 # Orchestrating Pi workers
 
 You are the judge. Workers (Pi, one long-lived `pi --mode rpc` process each) do the grunt work; you decide what is accepted.
+
+## Reuse workers: they are RPC processes, not one-shot calls
+
+A finished worker is not gone. Its Pi process stays up (and after 30 idle minutes its saved session is resumed on demand), holding everything it read, ran and learned about the codebase. `pi_send` gives it a new task with all that context intact.
+
+- **Prefer `pi_send` over `pi_spawn`** for fixes, follow-ups and the next task in the same area of the code. A fresh spawn re-reads the same files and re-learns the same layout: that is the churn to avoid.
+- Re-spawn only when the approach was wrong, the worker's context is polluted by a bad path, or the new task is in an unrelated part of the project.
+- Keep a worker alive while you might still need it: `pi_cleanup` ends its process and forgets it. Merge first (`pi_merge`), then send the next task to the same worker if it builds on the same code.
+- A sent message needs no restated background, only the new instruction (it still cannot see this conversation).
 
 ## When to use workers
 
@@ -25,17 +34,27 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 ## Project dictionary
 
-`pi_dict` keeps a short glossary of the project (term -> definition: what a system is called, what it does, where it lives, conventions, how to run tests). It is injected into every worker's system prompt, so workers stop re-learning the project. It is a dictionary, not a log: no task notes, no history.
+`pi_dict` keeps a short glossary of the project (term -> definition: what a system is called, what it does, where it lives, conventions). Test and build commands belong in `pi_tools`, not here. It is injected into every worker's system prompt, so workers stop re-learning the project. It is a dictionary, not a log: no task notes, no history.
 
 - **Seed it before the first `pi_spawn`** (a `dev`/`general` spawn is refused until it has entries) for a project, from what you already understand. If you know little, spawn one `explore` worker first, verify its findings, then seed.
 - **Add after review**, never before: write only facts you checked yourself (in a diff or a report with file:line evidence). Do not copy a worker's unverified claim into the dictionary; every later worker would inherit the mistake.
 - Keep entries to one or two sentences and name file paths. Fix or remove entries that a worker reports as contradicted by the code.
 - It is capped (6000 chars total, 300 per entry). If it is full, tighten or remove entries.
 
+## Project toolbox (checks workers run themselves)
+
+`pi_tools` holds the checks (compile, tests, lint) that `dev`/`general` workers are expected to run on their own work, with the `check <name>` command the plugin puts on their PATH. Each worker's prompt lists its toolbox; `required` checks must run after the worker's last edit (the guard reminds it, and the digest shows `checks run:` and warns `required check not run` / `check FAILED`).
+
+- **Workers test their own work.** Never write "do not run the tests / the unity CLI / the editor" in a brief or a dictionary entry. If parallel runs would collide (a Unity project lock, a Gradle daemon), mark the check `serial`: it holds a lock shared by every worker of the project, so they queue instead of colliding.
+- **Unity projects get a toolbox by default**: `unity-compile` (required, ~20 s, lists every `error CS####` with file:line), `unity-editmode` (required; workers pass `--filter "Ns.TestClass"` to run only the tests they touched) and `unity-playmode` (optional). All serial; a run held by another batch Unity run waits and retries. Worktree workers get a copy-on-write clone of `Library`, so they do not re-import. Only a Unity editor GUI the user has open on the same project blocks them; workers then report the error instead of guessing.
+- **Other projects**: `pi_tools set` the real commands before the first `dev` spawn (e.g. `./gradlew testDebugUnitTest --offline`, `godot --headless -s addons/gut/gut_cmdln.gd`). A check runs from the project root; use `$TMPDIR` for its outputs, `report` for an NUnit/JUnit XML, `log` for an extra log file.
+- `checks` on `pi_spawn` overrides which checks are required for one task (`[]` for none, e.g. a docs-only change).
+- Still run the full suite yourself after merging.
+
 ## Loop
 
 1. **Decompose** into pieces that touch different files. Overlapping pieces will conflict at merge.
-2. **Brief** each worker with `pi_spawn`. The brief must stand alone: the worker cannot see this conversation (it does see the project dictionary). State the goal, the files it may touch, how to verify (a test command), and "touch no other files". Do not ask for a SUMMARY or FINDINGS block; the plugin adds the right reporting instruction for the agent type.
+2. **Brief** each worker with `pi_spawn`. The brief must stand alone: the worker cannot see this conversation (it does see the project dictionary and its toolbox). State the goal, the files it may touch, which tests cover the change (so it can filter its test check), and "touch no other files". Do not ask for a SUMMARY or FINDINGS block; the plugin adds the right reporting instruction for the agent type.
 3. **Wait** with `pi_wait`. A call waits up to 90 seconds; call again while workers are still running. `pi_status` shows live tok/s and cost per worker, plus the session total, if you only need a glance; do not poll it in a loop.
 4. **Review** with `pi_digest`, then verify the claims with `pi_diff`. A digest is what the worker says it did plus `git status` taken from the repo. Read the diff before accepting anything that matters.
 5. **Judge**:
@@ -47,7 +66,7 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 ## Verification, time and warnings
 
-- **Real test runner the worker cannot run** (a locked editor, a license-bound tool): do not let it build a substitute. Pass `verify` (and `fixRounds` 1–2) on `pi_spawn`; the plugin runs it for you after the worker finishes, one at a time, and puts the result in the digest.
+- **Tests**: put them in the toolbox (`pi_tools`) so workers run and fix them themselves. Use `verify` (with `fixRounds` 1–2) only for a final gate the worker must not run itself; the plugin runs it after the worker finishes, one at a time, and puts the result in the digest.
 - **`expect`**: list the files a task must change. A worker that finishes without touching them is flagged ⚠ in the digest and the wake-up message; a `NO FILES CHANGED` warning means the worker did nothing, whatever it reported.
 - **Time**: a timed-out worker reports what it finished. Read that report, then `pi_send` it (with `maxMinutes`) to continue instead of re-spawning.
 - **Hard tasks**: raise `effort` for that worker (`pi_spawn` or `pi_send`); the default is low.

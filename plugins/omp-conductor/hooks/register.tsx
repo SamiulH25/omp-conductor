@@ -35,6 +35,58 @@ const STALE_MS = 14 * 24 * 3600 * 1000
 const DICT_PREFIX = 'dict:'
 const DICT_MAX_CHARS = 6000 // whole dictionary; keeps the injected context small
 const DICT_DEF_CHARS = 300 // one definition; a dictionary entry, not an essay
+// Project toolbox: the checks (tests, compile, lint) workers are expected to run themselves, with the `check` command
+// from bin/. Kept per project root in the store; a Unity project with none set gets UNITY_TOOLS.
+const TOOLS_PREFIX = 'tools:'
+type Check = {
+  command: string // bash, run from the project root (the worker's worktree root when it has one)
+  purpose: string
+  required: boolean // must pass after the worker's last edit, before it reports
+  serial: boolean // one run at a time across all workers of the project (a tool that locks the project)
+  timeoutSec: number
+  report?: string // NUnit/JUnit XML the command writes; failed tests are listed from it ($TMPDIR allowed)
+  log?: string // extra log the command writes, searched for error lines on a failure
+  highlight?: string // regex for the error lines worth showing from the output on a failure
+  retryIf?: string // regex: on a failure whose output matches, wait and retry (a capture group 1 PID: only while it is a batch run)
+}
+const CHECK_NAME = /^[a-z0-9][a-z0-9._-]{0,39}$/
+const UNITY_HIGHLIGHT = 'error CS\\d+|compiler errors|already open in a running Editor|another Unity instance|FAILED|Exception|TEST_|did not complete|aborting'
+const UNITY_BUSY = 'already open in a running Editor \\(PID (\\d+)\\)'
+const UNITY_TOOLS: Record<string, Check> = {
+  'unity-compile': {
+    // A filter that matches no test: the editor compiles every assembly and stops (about 20 s; 5 s on an error).
+    command: 'unity test . --mode EditMode --filter "Omp.Conductor.NoTest" --output "$TMPDIR/compile.xml" --non-interactive --no-banner -- -logFile "$TMPDIR/unity-compile.log"',
+    purpose: 'compiles every assembly (runtime, editor, tests) in a headless Unity editor and lists each error CS#### with file:line. Fast (~20 s): run it after each batch of edits',
+    required: true,
+    serial: true,
+    timeoutSec: 600,
+    log: '$TMPDIR/unity-compile.log',
+    highlight: UNITY_HIGHLIGHT,
+    retryIf: UNITY_BUSY,
+  },
+  'unity-editmode': {
+    command: 'unity test . --mode EditMode {args} --output "$TMPDIR/editmode.xml" --non-interactive --no-banner -- -logFile "$TMPDIR/unity-editmode.log"',
+    purpose: 'runs the EditMode tests headless and lists failed tests with messages. The full suite takes minutes, so pass a filter for the tests your change touches: check unity-editmode --filter "Namespace.TestClass" (several: "A;B"). The supervisor runs the full suite after merging',
+    required: true,
+    serial: true,
+    timeoutSec: 1200,
+    report: '$TMPDIR/editmode.xml',
+    log: '$TMPDIR/unity-editmode.log',
+    highlight: UNITY_HIGHLIGHT,
+    retryIf: UNITY_BUSY,
+  },
+  'unity-playmode': {
+    command: 'unity test . --mode PlayMode {args} --output "$TMPDIR/playmode.xml" --non-interactive --no-banner -- -noaudio -logFile "$TMPDIR/unity-playmode.log"',
+    purpose: 'runs the PlayMode tests headless (slow); run it, filtered like unity-editmode, when you changed runtime behaviour that PlayMode tests cover',
+    required: false,
+    serial: true,
+    timeoutSec: 1500,
+    report: '$TMPDIR/playmode.xml',
+    log: '$TMPDIR/unity-playmode.log',
+    highlight: UNITY_HIGHLIGHT,
+    retryIf: UNITY_BUSY,
+  },
+}
 
 // First-run files for the worker agent dir, written only when missing so the user's edits stay.
 const WORKER_PROMPT = `You are a worker subagent. An orchestrator gave you one task in a project directory; do it and report back.
@@ -92,7 +144,7 @@ type AgentType = {
 }
 
 const WORKER_RULES =
-  ' EDITING: make ONE edit per edit call (never batch several in one call); copy oldText exactly from a fresh read of that region; if an edit fails, re-read the region and retry that single edit. Never fall back to python/sed/heredoc rewrites of source files. TESTING: if the project\'s real test runner cannot be run from here (a locked editor, a missing tool), do NOT build a substitute harness or checker anywhere; make the change, check it by reading, and say plainly that it is unverified. Only run the check the task names. SCRATCH: put any scratch file in $TMPDIR, never in the project and never in /tmp directly. OTHERS: other workers may be editing other files in this project at the same time; compile errors in files you did not touch belong to them, so do not fix or work around them. Stay on the task: if you finish without changing the files you were asked to change, say so and why.'
+  ' EDITING: make ONE edit per edit call (never batch several in one call); copy oldText exactly from a fresh read of that region; if an edit fails, re-read the region and retry that single edit. Never fall back to python/sed/heredoc rewrites of source files. TESTING: if your prompt has a TOOLBOX, those checks are yours to run with `check <name>`; run them, do not reason your way out of them. Otherwise run the check the task names. Never build a substitute harness or checker anywhere (no stub projects, no reimplemented engine APIs, no copied DLLs): if a real check cannot run (missing tool, project locked, timeout), make the change, check it by reading, and report the exact error and that it is unverified. SCRATCH: put any scratch file in $TMPDIR, never in the project and never in /tmp directly. OTHERS: other workers may be editing other files in this project at the same time; compile errors in files you did not touch belong to them, so do not fix or work around them. Stay on the task: if you finish without changing the files you were asked to change, say so and why.'
 const READ_ONLY = ['read', 'grep', 'find', 'ls']
 const READ_ONLY_ROLE =
   'PERMISSIONS: read-only. You can read, search and list files; you cannot and must not modify, create or delete anything, run builds or change any state. Your tools are restricted accordingly; do not try to work around that. If the task needs a change, describe the change and where it belongs instead of making it.'
@@ -114,7 +166,7 @@ const AGENTS: Record<string, AgentType> = {
     worktree: 'auto',
     report: 'summary',
     maxMinutes: 20,
-    role: 'You are a dev agent. PERMISSIONS: you may read, edit and create files and run shell commands, only inside the working directory and only for what the task asks. Do not touch unrelated files, do not install global packages, do not run git commit, push, checkout or reset (the supervisor commits and merges), and do not delete anything outside the task. Verify your work with the tests or checks named in the task before you finish.' + WORKER_RULES,
+    role: 'You are a dev agent. PERMISSIONS: you may read, edit and create files and run shell commands, only inside the working directory and only for what the task asks. Do not touch unrelated files, do not install global packages, do not run git commit, push, checkout or reset (the supervisor commits and merges), and do not delete anything outside the task. Verify your work before you finish: with your TOOLBOX checks if you have any, and with the tests or checks named in the task.' + WORKER_RULES,
     suffix: SUFFIX,
   },
   explore: {
@@ -200,6 +252,8 @@ type Worker = {
   verifyResult?: { ok: boolean; exit: number; tail: string }
   warn: string[] // things the supervisor must not miss: no changes made, expected files untouched, verify failed
   expect?: string[] // paths (relative to dir) the task must change
+  checks?: string[] // toolbox checks this worker must run (and pass) after its last edit
+  checkRuns?: { name: string; ok: boolean; exit: number; secs: number }[] // the `check` runs of the last run, oldest first
   effort?: string // per-worker reasoning effort override
   effortSent?: string
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
@@ -291,6 +345,7 @@ export const register: Register = on => {
   let agentDir = ''
   let apiKey = ''
   let sid = ''
+  let hostPath = ''
   let ensureSetup: () => Promise<string | undefined> = async () => undefined
   let setupProblems: string[] = ['setup not checked yet']
   const roots = () => [cwd, home, ...ROOTS_EXTRA]
@@ -572,6 +627,8 @@ export const register: Register = on => {
     const avg = w.genMs > 0 ? `, ~${Math.round(w.outTokens / (w.genMs / 1000))} tok/s` : ''
     lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
     for (const x of w.warn) lines.push(`⚠ ${x}`)
+    if (w.checkRuns?.length) lines.push(`checks run: ${w.checkRuns.map(c => `${c.name} ${c.ok ? 'PASS' : `FAIL(${c.exit})`} ${c.secs}s`).join(', ')}`)
+    else if (w.checks?.length && w.state !== 'running') lines.push(`checks run: none (required: ${w.checks.join(', ')})`)
     if (w.verifyResult) lines.push(`verify ${w.verifyResult.ok ? 'PASSED' : `FAILED (exit ${w.verifyResult.exit})`}: ${w.verify}${w.verifyResult.ok ? '' : `\n${w.verifyResult.tail}`}`)
     const final = w.texts.at(-1)?.trim()
     const own = ownSummary(w)
@@ -609,12 +666,39 @@ export const register: Register = on => {
     return workers.get(id)
   }
 
+  // The project's toolbox: what the supervisor set with pi_tools, else the built-in Unity checks for a Unity project
+  // (at the repo root or at dir inside it). `sub` is where the Unity project sits inside the root.
+  type Toolbox = { checks: Record<string, Check>; source: 'set' | 'unity default' | 'none'; sub: string }
+  const loadTools = async ($: any, root: string, dir: string): Promise<Toolbox> => {
+    const real = ((await B?.realPath(dir)) ?? dir).replace(/\/+$/, '')
+    let unity: string | undefined
+    for (const p of real === root || !real.startsWith(`${root}/`) ? [root] : [real, root]) {
+      if (await $.fs.exists(`${p}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) {
+        unity = p.slice(root.length)
+        break
+      }
+    }
+    // A stored toolbox wins, even an empty one (every check removed on purpose); reset brings back the default.
+    const set = (await $.store.get(TOOLS_PREFIX + root).catch(() => undefined)) as Record<string, Check> | undefined
+    if (set && typeof set === 'object') return { checks: set, source: 'set', sub: unity ?? '' }
+    if (unity !== undefined) return { checks: UNITY_TOOLS, source: 'unity default', sub: unity }
+    return { checks: {}, source: 'none', sub: '' }
+  }
+  const toolsText = (t: Toolbox) =>
+    Object.entries(t.checks)
+      .map(([n, c]) => `- ${n}${c.required ? ' (required)' : ''}${c.serial ? ' [serial]' : ''}: ${c.purpose}\n    runs: ${c.command}`)
+      .join('\n')
+
   // ---------------------------------------------------------------- hooks
   on('session.start', async ($, e, next) => {
     cwd = (e as { cwd?: string }).cwd ?? ''
     home = (await $.process.run(['printenv', 'HOME']).catch(() => undefined))?.stdout.trim() ?? ''
     agentDir = `${home}/${AGENT_DIR_NAME}`
     sid = String(await $.session.id())
+    hostPath = (await $.process.run(['printenv', 'PATH']).catch(() => undefined))?.stdout.trim() ?? ''
+    await $.fs.write(`${agentDir}/locks/.keep`, '').catch(() => undefined)
+    // A checkout or a zip can lose the exec bit of the `check` runner workers call.
+    void $.process.run(['chmod', '+x', `${$.plugin.root}/bin/check`], { timeoutMs: 5000 }).catch(() => undefined)
 
     // Pi must be installed and the OpenCode Go key present. Create the agent dir's files if missing, then check.
     const checkSetup = async (): Promise<string[]> => {
@@ -680,6 +764,8 @@ export const register: Register = on => {
       sub: w.sub,
       warn: w.warn,
       expect: w.expect,
+      checks: w.checks,
+      checkRuns: w.checkRuns,
       effort: w.effort,
       marker: w.marker,
       snapDir: w.snapDir,
@@ -984,6 +1070,25 @@ export const register: Register = on => {
             }
           }
         }
+        // What the worker's `check` runs recorded (bin/check appends one line per run to $TMPDIR/checks.jsonl).
+        const log = await $.fs.read(`${tmpDir(w)}/checks.jsonl`).catch(() => undefined)
+        w.checkRuns = (typeof log === 'string' ? log.split('\n') : [])
+          .flatMap(l => {
+            try {
+              const r = JSON.parse(l)
+              return r && typeof r.name === 'string' && r.at >= w.startedAt ? [{ name: r.name, ok: !!r.ok, exit: Number(r.exit), secs: Number(r.secs) }] : []
+            } catch {
+              return []
+            }
+          })
+          .slice(-12)
+        if (w.state !== 'killed') {
+          for (const n of w.checks ?? []) {
+            const last = w.checkRuns.filter(r => r.name === n).at(-1)
+            if (!last) w.warn.push(`required check not run: ${n}`)
+            else if (!last.ok) w.warn.push(`check FAILED: ${n} (exit ${last.exit})`)
+          }
+        }
         await sync()
         $.ui.toast(`worker ${w.id} ${w.state}${w.warn.length ? ' ⚠' : ''}: ${w.title}`)
         if (!w.killed) B?.wake(w.id)
@@ -998,6 +1103,9 @@ export const register: Register = on => {
       TMPDIR: tmpDir(w), // scratch files stay out of the project and out of /tmp
       ...(w.snapDir ? { PI_SNAPSHOT_DIR: w.snapDir } : {}),
       ...(w.worktree ? { PI_MAIN_ROOT: w.root, PI_WORK_ROOT: w.worktree } : {}), // the guard keeps the worker inside its worktree
+      PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`, // the `check` runner
+      PI_CHECKS_FILE: `${tmpDir(w)}/checks.json`,
+      PI_CHECKS_REQUIRED: (w.checks ?? []).join(','), // the guard asks for these after the last edit
     })
     const cmdFile = (w: Worker) => `${agentDir}/run/${sid}-${w.id}.jsonl`
 
@@ -1018,7 +1126,21 @@ export const register: Register = on => {
       if (kind.tools) args.push('--tools', kind.tools.join(','))
       const dict = await dictText(w.root)
       const jail = w.worktree ? `WORKTREE: your working directory is a private git worktree of ${w.root}. Use relative paths only. Never read or write under ${w.root} itself, even if the task text names it: that is the main checkout and other workers' merge target. Treat any such path in the task as the same path inside your working directory.` : ''
-      const sys = [kind.role, jail, dict].filter(Boolean).join('\n\n')
+      // The toolbox goes to workers that can run commands: a file for bin/check and a section in the prompt.
+      let toolbox = ''
+      if (!kind.tools || kind.tools.includes('bash')) {
+        const t = await loadTools($, w.root, w.dir)
+        if (Object.keys(t.checks).length) {
+          const lockKey = [...`${w.root}${t.sub}`].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) >>> 0, 7).toString(36)
+          const checks = Object.fromEntries(
+            Object.entries(t.checks).map(([n, c]) => [n, { ...c, required: (w.checks ?? []).includes(n), lock: `${agentDir}/locks/${n}-${lockKey}.lock` }]),
+          )
+          await $.fs.write(`${tmpDir(w)}/checks.json`, JSON.stringify({ cwd: `${w.worktree ?? w.root}${t.sub}`, checks }, null, 2)).catch(() => undefined)
+          const req = w.checks ?? []
+          toolbox = `TOOLBOX: the checks your supervisor expects you to run yourself in this project. Running them is allowed and safe: a [serial] check holds a lock shared with the other workers, so you never collide with them (you may wait a while for one to finish). These instructions replace any older dictionary note telling workers not to run these tools.\n${toolsText({ ...t, checks })}\nRun one with \`check <name>\` in bash (\`check all\` runs the required ones, \`check\` lists them). It runs from the project root with the right flags, keeps the full log in $TMPDIR and prints the verdict, the failed tests and error lines, and the log tail. Do not run the underlying command by hand.\n${req.length ? `REQUIRED for this task: ${req.map(n => `\`check ${n}\``).join(', ')}. Run them after your last edit and before your final report. If one fails because of your change, fix it and run it again. If it fails for a reason outside your change (another worker's file, an editor holding the project, a timeout), do not work around it: quote the error lines in your report.` : 'None is required for this task; run one when it is the quickest way to know your change works.'}`
+        }
+      }
+      const sys = [kind.role, jail, toolbox, dict].filter(Boolean).join('\n\n')
       if (sys) args.push('--append-system-prompt', sys)
       if (w.session) args.push('--session', w.session)
       w.effortSent = w.effort ?? currentThinking
@@ -1096,7 +1218,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_spawn',
       description:
-        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers always use the model the user set with /pi-model (not selectable here). Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers always use the model the user set with /pi-model (not selectable here). Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
@@ -1108,7 +1230,8 @@ export const register: Register = on => {
             description: `Agent type (default ${DEFAULT_AGENT}). ${Object.entries(AGENTS).map(([k, a]) => `${k}: ${a.about}`).join('; ')}`,
           },
           maxMinutes: { type: 'number', description: 'time limit for the run (default depends on agent type, 15-20). At 85% the worker is told to wrap up; at 100% it is asked for a partial report and gets 2 more minutes before it is stopped. pi_send can resume it.' },
-          verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Use it for the real test runner the worker cannot run (e.g. a locked editor). The result goes in the digest; a failure counts as a warning.' },
+          checks: { type: 'array', items: { type: 'string' }, description: 'Toolbox checks (pi_tools) the worker must run and pass after its last edit. Default: the toolbox entries marked required. [] = none for this task. The worker runs them itself with `check <name>`; serial ones never run twice at once.' },
+          verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Prefer toolbox checks (pi_tools), which the worker runs and fixes itself; use verify for a final gate the worker must not run. The result goes in the digest; a failure counts as a warning.' },
           verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
           fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
@@ -1125,7 +1248,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_dict',
       description:
-        'The project dictionary: short term -> definition entries (what a system is called, what it does, where it lives, conventions, how to run tests) that are injected into every worker for that project. Seed it from what you already understand BEFORE the first pi_spawn; after reviewing a worker, add facts you verified (never unverified worker claims). Not for task notes or history. action: show | set (upsert entries) | remove (terms).',
+        'The project dictionary: short term -> definition entries (what a system is called, what it does, where it lives, conventions) that are injected into every worker for that project. Seed it from what you already understand BEFORE the first pi_spawn; after reviewing a worker, add facts you verified (never unverified worker claims). Not for task notes or history. action: show | set (upsert entries) | remove (terms).',
       inputSchema: obj(
         {
           action: { type: 'string', enum: ['show', 'set', 'remove'] },
@@ -1136,6 +1259,38 @@ export const register: Register = on => {
             items: obj({ term: { type: 'string' }, definition: { type: 'string' } }, ['term', 'definition']),
           },
           terms: { type: 'array', items: { type: 'string' }, description: 'For remove' },
+        },
+        ['action'],
+      ),
+    })
+    await $.tool.register({
+      name: 'pi_tools',
+      description:
+        'The project toolbox: the checks (tests, compile, lint) workers are expected to run THEMSELVES with `check <name>` before reporting. Shown in every dev/general worker\'s prompt; required checks are enforced (the worker is reminded, and the digest warns if one was not run or failed). serial checks hold a project-wide lock, so a tool that cannot run twice at once (a Unity editor, a Gradle daemon) is safe with parallel workers: do not forbid workers from running it. A Unity project with no toolbox set gets built-in unity-editmode (required) and unity-playmode checks. action: show | set (upsert checks) | remove (names) | reset (drop all, back to the built-in default).',
+      inputSchema: obj(
+        {
+          action: { type: 'string', enum: ['show', 'set', 'remove', 'reset'] },
+          dir: { type: 'string', description: 'Any directory inside the project (default: session cwd)' },
+          checks: {
+            type: 'array',
+            description: 'For set: checks to add or replace. The first set on a project starts from the built-in default if there is one.',
+            items: obj(
+              {
+                name: { type: 'string', description: 'Short id, e.g. editmode, unit, lint' },
+                command: { type: 'string', description: 'bash command, run from the project root (the worker\'s worktree root when it has one). $TMPDIR is the worker\'s scratch dir.' },
+                purpose: { type: 'string', description: 'One line: what it checks and when to run it' },
+                required: { type: 'boolean', description: 'Default true: every dev/general worker must run it after its last edit' },
+                serial: { type: 'boolean', description: 'Default false: true = one run at a time across all workers of this project (locks the project, heavy)' },
+                timeoutSec: { type: 'number', description: 'Default 600' },
+                report: { type: 'string', description: 'NUnit/JUnit XML path the command writes; failed tests are listed from it' },
+                log: { type: 'string', description: 'Extra log file the command writes, searched for error lines on failure' },
+                highlight: { type: 'string', description: 'Regex for the error lines to show on failure' },
+                retryIf: { type: 'string', description: 'Regex: when a failed run\'s output matches, wait 15 s and retry within the timeout (a tool another process holds briefly). If group 1 captures a PID, retry only while that process is a -batchmode run' },
+              },
+              ['name', 'command', 'purpose'],
+            ),
+          },
+          names: { type: 'array', items: { type: 'string' }, description: 'For remove' },
         },
         ['action'],
       ),
@@ -1167,7 +1322,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_send',
       description:
-        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes instead of re-spawning. The worker must not be running.',
+        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes and for the next task in the same area instead of re-spawning (no re-reading, no re-learning the layout). Send only the new instruction; it already has the background. The worker must not be running.',
       inputSchema: obj(
         {
           ...idProp,
@@ -1202,7 +1357,7 @@ export const register: Register = on => {
       inputSchema: obj({ ...idProp, force: { type: 'boolean' } }, ['id']),
     })
 
-    await $.command.register({ name: 'conductor', description: 'Show the omp-conductor workers pane' })
+    await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
     await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
 
@@ -1297,8 +1452,13 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'conductor' }, async ($, e) => {
-    await $.ui.open({ id: PANE, title: 'workers' })
     const arg = String((e as { args?: string }).args ?? '').trim()
+    // A bare /conductor toggles: it closes the pane when it is already open.
+    if (arg !== 'demo' && (await $.ui.panes()).some(p => p.id === PANE)) {
+      await $.ui.close({ id: PANE })
+      return { text: 'conductor pane closed.' }
+    }
+    await $.ui.open({ id: PANE, title: 'workers' })
     if (arg === 'demo') {
       demoOn = !demoOn
       await update($, demoAtom, () => demoOn)
@@ -1336,8 +1496,21 @@ export const register: Register = on => {
       const have = Object.keys(((await $.store.get(DICT_PREFIX + (isGit ? top!.stdout.trim() : dir)).catch(() => undefined)) as object | undefined) ?? {}).length
       if (!have) {
         seq -= 1
-        return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, how to build and test, what the workers must NOT do or cannot run (for example a locked editor). Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
+        return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, conventions, what workers must not touch. Put the checks workers should run themselves (tests, compile) in pi_tools, not the dictionary. Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
       }
+    }
+    const projRoot = isGit ? top!.stdout.trim() : dir
+    const tools = await loadTools($, projRoot, dir)
+    let checks: string[] = []
+    if (!kind.tools || kind.tools.includes('bash')) {
+      if (Array.isArray(e.checks)) {
+        checks = (e.checks as unknown[]).map(String)
+        const unknown = checks.filter(n => !tools.checks[n])
+        if (unknown.length) {
+          seq -= 1
+          return text(`unknown check(s) ${unknown.join(', ')}; the toolbox for ${projRoot} has: ${Object.keys(tools.checks).join(', ') || 'nothing (add some with pi_tools set)'}`, true)
+        }
+      } else checks = Object.entries(tools.checks).filter(([, c]) => c.required).map(([n]) => n)
     }
     let worktree: string | undefined
     let branch: string | undefined
@@ -1361,6 +1534,14 @@ export const register: Register = on => {
       const real = (await B?.realPath(dir)) ?? dir
       const inside = real.startsWith(`${root}/`) ? real.slice(root.length) : ''
       if (inside && (await $.fs.exists(`${path}${inside}`).catch(() => false))) sub = inside
+      // A Unity project's Library (the import cache) is not in git, and without it a worktree's first Unity run
+      // re-imports everything. Copy-on-write clone it (btrfs/xfs: instant, no extra space); skipped elsewhere.
+      const lib = `${root}${tools.sub}/Library`
+      if ((await $.fs.exists(`${root}${tools.sub}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) && (await $.fs.exists(lib).catch(() => false))) {
+        await $.process.run(['cp', '-a', '--reflink=always', lib, `${path}${tools.sub}/Library`], { timeoutMs: 120_000 }).catch(() => undefined)
+        // The clone must not claim the editor that has the main project open.
+        await $.process.run(['rm', '-f', `${path}${tools.sub}/Library/EditorInstance.json`], { timeoutMs: 10_000 }).catch(() => undefined)
+      }
     }
     const w: Worker = {
       id,
@@ -1396,6 +1577,7 @@ export const register: Register = on => {
       verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
       fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
       expect: Array.isArray(e.expect) ? (e.expect as unknown[]).map(String).filter(Boolean) : undefined,
+      checks: checks.length ? checks : undefined,
       effort: e.effort === undefined ? undefined : String(e.effort),
       cost: 0,
       warn: [],
@@ -1420,6 +1602,7 @@ export const register: Register = on => {
     const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
     return text(
       `started ${id} [${agent}] "${w.title}" in ${workDir(w)}` +
+        (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
         (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
     )
   })
@@ -1469,6 +1652,64 @@ export const register: Register = on => {
       return text(`removed ${gone.length}/${terms.length}. ${render().split('\n')[0]}`)
     }
     return text('action must be show, set or remove', true)
+  })
+
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_tools' }, async ($, e) => {
+    const action = String(e.action ?? '')
+    const dir = String(e.dir ?? cwd)
+    if (!(await B?.realPath(dir))) return text(`dir ${dir} does not exist`, true)
+    if (!(await insideRoots(dir))) return text(`dir ${dir} is outside the allowed roots or is a protected dir`, true)
+    const top = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: 10_000 }).catch(() => undefined)
+    const root = top?.exitCode === 0 ? top.stdout.trim() : dir
+    const key = TOOLS_PREFIX + root
+    const t = await loadTools($, root, dir)
+    const render = (x: Toolbox) =>
+      `${root}: ${Object.keys(x.checks).length} check(s)${x.source === 'unity default' ? ' (built-in Unity default; pi_tools set to customize)' : ''}${Object.keys(x.checks).length ? `\n${toolsText(x)}` : '\nnone: workers only run the checks a brief names'}`
+    if (action === 'show') return text(render(t))
+    if (action === 'reset') {
+      await $.store.delete(key).catch(() => undefined)
+      return text(`toolbox reset. ${render(await loadTools($, root, dir))}`)
+    }
+    if (action === 'set') {
+      const list = Array.isArray(e.checks) ? (e.checks as Record<string, unknown>[]) : []
+      if (!list.length) return text('checks is required for set', true)
+      const next: Record<string, Check> = { ...t.checks }
+      for (const c of list) {
+        const name = String(c.name ?? '').trim()
+        if (!CHECK_NAME.test(name)) return text(`bad check name "${name}": lowercase letters, digits, . _ - (max 40)`, true)
+        const command = String(c.command ?? '').trim()
+        const purpose = one(String(c.purpose ?? ''))
+        if (!command || !purpose) return text(`check "${name}" needs a command and a purpose`, true)
+        next[name] = {
+          command,
+          purpose: clip(purpose, 240),
+          required: c.required !== false,
+          serial: c.serial === true,
+          timeoutSec: typeof c.timeoutSec === 'number' && c.timeoutSec > 0 ? Math.min(c.timeoutSec, 3600) : 600,
+          ...(typeof c.report === 'string' && c.report ? { report: c.report } : {}),
+          ...(typeof c.log === 'string' && c.log ? { log: c.log } : {}),
+          ...(typeof c.highlight === 'string' && c.highlight ? { highlight: c.highlight } : {}),
+          ...(typeof c.retryIf === 'string' && c.retryIf ? { retryIf: c.retryIf } : {}),
+        }
+        try {
+          for (const re of [next[name]!.highlight, next[name]!.retryIf]) if (re) new RegExp(re)
+        } catch {
+          return text(`check "${name}": highlight or retryIf is not a valid regex`, true)
+        }
+      }
+      await $.store.set(key, next).catch(() => undefined)
+      return text(`saved ${list.length} check(s); applies to workers started from now on. ${render({ ...t, checks: next, source: 'set' })}`)
+    }
+    if (action === 'remove') {
+      const names = Array.isArray(e.names) ? (e.names as unknown[]).map(String) : []
+      if (!names.length) return text('names is required for remove', true)
+      const next = { ...t.checks }
+      const gone = names.filter(n => n in next)
+      for (const n of gone) delete next[n]
+      await $.store.set(key, next).catch(() => undefined)
+      return text(`removed ${gone.length}/${names.length}. ${render({ ...t, checks: next, source: 'set' })}`)
+    }
+    return text('action must be show, set, remove or reset', true)
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_status' }, async $ => {
