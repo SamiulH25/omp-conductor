@@ -320,6 +320,7 @@ function serializeWorkerRecord(w: any, sessionId: string, detailed: boolean) {
     title: bounded(w.title, 300),
     task: bounded(w.task, w.state === 'queued' ? 200000 : 500),
     after: w.after,
+    dependencyReports: w.dependencyReports,
     queuedReason: w.queuedReason,
     dir: w.dir,
     root: w.root,
@@ -429,6 +430,9 @@ const ledgerAtom = atom({ plugin: 'omp-conductor', key: 'ledger' } as const, { c
 type State = 'running' | 'queued' | 'done' | 'failed' | 'killed'
 type WorkerView = Omit<WorkerViewBase, 'state'> & { state: State }
 
+const firstWaitChanged = (state: State, wasQueued: boolean, warningCount: number, previousWarningCount: number) =>
+  (wasQueued && state === 'running') || (state !== 'running' && state !== 'queued') || warningCount > previousWarningCount
+
 type Worker = {
   id: string
   title: string
@@ -438,6 +442,8 @@ type Worker = {
   restored?: boolean
   interruptedQueued?: boolean
   after?: string[]
+  dependencyReports?: Record<string, string>
+  cleanupPending?: boolean
   queuedReason?: string
   dir: string
   root: string // git toplevel, or dir outside git; keys the project dictionary
@@ -467,6 +473,8 @@ type Worker = {
   interruptedRun?: string
   interrupting?: boolean
   settleWaiters?: (() => void)[]
+  launchLock?: Promise<void>
+  pendingLedger?: number
   last: string
   steps: number
   tokensIn: number
@@ -711,6 +719,11 @@ Optional
 
 export const register: Register = on => {
   const workers = new Map<string, Worker>()
+  let pendingLedgerUpdates = 0
+  const dependencySnapshots = new Map<string, string>()
+  const waitListeners = new Set<() => void>()
+  const notifyWaiters = () => { for (const listener of waitListeners) listener() }
+  const pushWarning = (w: Worker, warning: string) => { w.warn.push(warning); notifyWaiters() }
   let B: Bridge | undefined
   let cwd = ''
   let home = ''
@@ -765,12 +778,17 @@ export const register: Register = on => {
 
   const workDir = (w: Worker) => (w.worktree ? `${w.worktree}${w.sub ?? ''}` : w.dir)
 
+  const dependencyResult = (upstream: Worker) => {
+    const detailed = upstream.agent === 'explore' || upstream.agent === 'review'
+    const report = detailed ? upstream.texts.at(-1) : ownSummary(upstream) ?? upstream.summary ?? upstream.texts.at(-1)
+    return `--- ${upstream.id} (${upstream.title}) ---\n${clip(report?.trim() || upstream.last, 3000)}`
+  }
+
   const dependencyPrompt = (w: Worker) => {
     const results = (w.after ?? []).map(id => {
-      const upstream = workers.get(id)!
-      const detailed = upstream.agent === 'explore' || upstream.agent === 'review'
-      const report = detailed ? upstream.texts.at(-1) : ownSummary(upstream) ?? upstream.summary ?? upstream.texts.at(-1)
-      return `--- ${id} (${upstream.title}) ---\n${clip(report?.trim() || upstream.last, 3000)}`
+      const cached = w.dependencyReports?.[id]
+      if (cached !== undefined) return cached
+      return dependencyResult(workers.get(id)!)
     })
     return results.length
       ? `Results from the workers you depend on:\n${results.join('\n\n')}\n\n--- Your task ---\n${w.task}`
@@ -778,16 +796,16 @@ export const register: Register = on => {
   }
 
   const scheduleQueue = () => {
-    if (!B) return
+    if (!B || pendingLedgerUpdates > 0) return
     let changed = true
     while (changed) {
       changed = false
       for (const w of workers.values()) {
-        if (w.state !== 'queued') continue
-        const waitingOn = (w.after ?? []).filter(id => workers.get(id)?.state !== 'done')
+        if (w.state !== 'queued' || w.cleanupPending) continue
+        const waitingOn = (w.after ?? []).filter(id => w.dependencyReports?.[id] === undefined && workers.get(id)?.state !== 'done')
         w.queuedReason = waitingOn.length ? `waiting for dependencies: ${waitingOn.join(', ')}` : 'waiting for a worker slot'
-        const bad = (w.after ?? []).map(id => ({ id, upstream: workers.get(id) })).find(({ upstream }) =>
-          !upstream || (upstream.state !== 'done' && upstream.state !== 'running' && upstream.state !== 'queued'),
+        const bad = (w.after ?? []).map(id => ({ id, upstream: workers.get(id) })).find(({ id, upstream }) =>
+          w.dependencyReports?.[id] === undefined && (!upstream || (upstream.state !== 'done' && upstream.state !== 'running' && upstream.state !== 'queued')),
         )
         if (bad) {
           const reason = `dependency ${bad.id} ${bad.upstream?.state ?? 'failed (cleaned up)'}`
@@ -797,18 +815,20 @@ export const register: Register = on => {
           w.last = reason
           w.endedAt = Date.now()
           void B.finished(w)
+          notifyWaiters()
           changed = true
         }
       }
       if (running() >= MAX_WORKERS) break
       const next = [...workers.values()].find(
-        w => w.state === 'queued' && (w.after ?? []).every(id => workers.get(id)?.state === 'done'),
+        w => w.state === 'queued' && (w.after ?? []).every(id => w.dependencyReports?.[id] !== undefined || workers.get(id)?.state === 'done'),
       )
       if (!next) break
       next.queuedReason = undefined
       next.startedAt = Date.now()
       next.last = 'starting'
       B.launch(next, dependencyPrompt(next))
+      notifyWaiters()
       changed = true
     }
   }
@@ -822,6 +842,12 @@ export const register: Register = on => {
     w.soft = undefined
     w.grace?.cancel()
     w.grace = undefined
+    if (budgetThreshold(w.cost, w.maxCost) === 'exceeded') {
+      const reason = `budget exceeded: worker spent ${money(w.cost)} of ${money(w.maxCost!)}`
+      w.killed = true
+      w.runError = reason
+      if (!w.errors.includes(reason)) w.errors.push(reason)
+    }
     if (w.timedOut && !w.killed && !w.interrupting && !w.runError) {
       w.runError = `time limit (${w.maxMinutes ?? 20}m) reached; the worker was asked for a partial report (its last message)`
       w.errors.push(w.runError)
@@ -838,11 +864,22 @@ export const register: Register = on => {
     }
     w.endedAt = Date.now()
     w.state = next
-    if (!w.interrupting) scheduleQueue()
-    if (w.interrupting) w.interrupting = false
+    const interruptSettlement = w.interrupting === true
+    if (next === 'done') {
+      const snapshot = dependencyResult(w)
+      dependencySnapshots.set(w.id, snapshot)
+      for (const dependent of workers.values()) {
+        if (dependent.state === 'queued' && dependent.after?.includes(w.id)) {
+          (dependent.dependencyReports ??= {})[w.id] = snapshot
+        }
+      }
+    }
+    if (!interruptSettlement && !w.pendingLedger) scheduleQueue()
+    if (interruptSettlement) w.interrupting = false
+    notifyWaiters()
     for (const settled of w.settleWaiters ?? []) settled()
     w.settleWaiters = []
-    void B?.finished(w)
+    if (!interruptSettlement) void B?.finished(w)
   }
 
   // ---------------------------------------------------------------- parsing
@@ -1021,7 +1058,16 @@ export const register: Register = on => {
         w.tokensOut += gen
         const cost = Number(u.cost?.total ?? 0)
         w.cost += cost
-        void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0, w)
+        w.pendingLedger = (w.pendingLedger ?? 0) + 1
+        pendingLedgerUpdates += 1
+        const ledger = B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0, w)
+        const ledgerSettled = () => {
+          w.pendingLedger = Math.max(0, (w.pendingLedger ?? 1) - 1)
+          pendingLedgerUpdates = Math.max(0, pendingLedgerUpdates - 1)
+          if (!pendingLedgerUpdates) scheduleQueue()
+        }
+        if (ledger) void ledger.then(ledgerSettled, ledgerSettled)
+        else ledgerSettled()
         // Exact decode speed for the turn: generated tokens over time after the first token.
         const decodeMs = m.duration != null ? Number(m.duration) - Number(m.ttft ?? 0) : w.firstAt ? Date.now() - w.firstAt : 0
         if (gen > 0 && decodeMs >= 150) {
@@ -1399,7 +1445,7 @@ export const register: Register = on => {
           if (level === 'warning' && !worker.budgetWarned) {
             worker.budgetWarned = true
             const warning = `worker budget warning: ${money(worker.cost)} of ${money(worker.maxCost!)} (80% reached)`
-            worker.warn.push(warning)
+            pushWarning(worker, warning)
             void sync()
             void worker.send?.({ type: 'steer', message: `Budget check: you have used at least 80% of your $${worker.maxCost!.toFixed(2)} worker budget. Keep remaining work concise and report what is complete.` })
           } else if (level === 'exceeded' && worker.state === 'running') {
@@ -1419,7 +1465,7 @@ export const register: Register = on => {
           for (const w of workers.values()) {
             if (w.state !== 'running') continue
             const warning = `session budget warning: ${money(total)} of ${money(sessionBudget!)} (80% reached)`
-            if (!w.warn.includes(warning)) w.warn.push(warning)
+            if (!w.warn.includes(warning)) pushWarning(w, warning)
             w.sessionBudgetWarned = true
             void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
           }
@@ -1513,7 +1559,7 @@ export const register: Register = on => {
         w.runError = undefined
         w.warn = []
         const workerBudget = budgetThreshold(w.cost, w.maxCost)
-        if (workerBudget === 'warning') w.warn.push(`worker budget warning: ${money(w.cost)} of ${money(w.maxCost!)} (80% reached)`)
+        if (workerBudget === 'warning') pushWarning(w, `worker budget warning: ${money(w.cost)} of ${money(w.maxCost!)} (80% reached)`)
         if (workerBudget === 'exceeded') {
           const reason = `budget exceeded: worker spent ${money(w.cost)} of ${money(w.maxCost!)}`
           w.killed = true
@@ -1544,10 +1590,10 @@ export const register: Register = on => {
             finish(w)
             return
           }
-          if (!w.send && !(await startProc(w))) return
+          if (!w.send && !(await startProc(w))) throw new Error('Pi process did not start')
           if (budgetThreshold(sessionSpent, sessionBudget) === 'warning') {
             const warning = `session budget warning: ${money(sessionSpent)} of ${money(sessionBudget!)} (80% reached)`
-            if (!w.warn.includes(warning)) w.warn.push(warning)
+            if (!w.warn.includes(warning)) pushWarning(w, warning)
             if (!w.sessionBudgetWarned) {
               w.sessionBudgetWarned = true
               void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
@@ -1581,7 +1627,13 @@ export const register: Register = on => {
           })
           const body = message + kind.suffix
           await w.send?.({ type: 'prompt', message: body.startsWith('/') ? `Task: ${body}` : body })
-        })()
+        })().catch(err => {
+          if (w.state !== 'running') return
+          w.runError = `worker failed to start: ${clip(one(String(err)), 200)}`
+          w.errors.push(w.runError)
+          w.stop?.()
+          finish(w)
+        })
       },
 
       changed: async w => {
@@ -1647,7 +1699,7 @@ export const register: Register = on => {
           return
         }
         w.verifyDone = true
-        if (!ok) w.warn.push(`verify FAILED (exit ${r?.exitCode ?? 'n/a'}): ${clip(one(tail), 160)}`)
+        if (!ok) pushWarning(w, `verify FAILED (exit ${r?.exitCode ?? 'n/a'}): ${clip(one(tail), 160)}`)
         finish(w)
       },
 
@@ -1656,9 +1708,9 @@ export const register: Register = on => {
         if (w.state !== 'killed' && (!kind.tools || kind.tools.includes('edit'))) {
           const changed = await B?.changed(w)
           if (changed) {
-            if (w.state === 'done' && changed.length === 0) w.warn.push('NO FILES CHANGED: the worker finished without modifying anything')
+            if (w.state === 'done' && changed.length === 0) pushWarning(w, 'NO FILES CHANGED: the worker finished without modifying anything')
             for (const x of w.expect ?? []) {
-              if (!changed.some(c => c === x || c.endsWith(`/${x}`))) w.warn.push(`expected change missing: ${x}`)
+              if (!changed.some(c => c === x || c.endsWith(`/${x}`))) pushWarning(w, `expected change missing: ${x}`)
             }
           }
         }
@@ -1677,8 +1729,8 @@ export const register: Register = on => {
         if (w.state !== 'killed') {
           for (const n of w.checks ?? []) {
             const last = w.checkRuns.filter(r => r.name === n).at(-1)
-            if (!last) w.warn.push(`required check not run: ${n}`)
-            else if (!last.ok) w.warn.push(`check FAILED: ${n} (exit ${last.exit})`)
+            if (!last) pushWarning(w, `required check not run: ${n}`)
+            else if (!last.ok) pushWarning(w, `check FAILED: ${n} (exit ${last.exit})`)
           }
         }
         await sync()
@@ -1931,11 +1983,11 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_wait',
       description:
-        'Wait until the given workers (default: all running or queued) finish or timeoutSec passes (max 90 per call; call again to keep waiting), then return their digests.',
+        'Call pi_wait with no args to wait for something to happen to any running or queued worker (default 300 seconds, max 900): by default it returns immediately when the first watched worker finishes, fails, is killed, starts after queuing, or gets a new ⚠ warning, with digests for the workers that changed. mode:"all" waits for every watched worker to finish; mode:"any" waits for the first finished worker. For a slow worker, use pi_btw to ask what it is doing without interrupting it.',
       inputSchema: obj({
         ids: { type: 'array', items: { type: 'string' } },
-        timeoutSec: { type: 'number' },
-        mode: { type: 'string', enum: ['all', 'any'], description: 'default all' },
+        timeoutSec: { type: 'number', description: 'Default 300 seconds, max 900.' },
+        mode: { type: 'string', enum: ['first', 'all', 'any'], description: 'default first' },
       }),
     })
     await $.tool.register({
@@ -2014,7 +2066,7 @@ export const register: Register = on => {
             const keys = (w.stuckKeys ??= [])
             if (keys.includes(finding.key)) continue
             keys.push(finding.key)
-            w.warn.push(finding.message)
+            pushWarning(w, finding.message)
             warned = true
             const askedAt = Date.now()
             if (!w.btwPending && (w.btwCount ?? 0) < 5 && (!w.btwAt || askedAt - w.btwAt >= 30_000)) {
@@ -2024,7 +2076,7 @@ export const register: Register = on => {
                   const newline = result.message.indexOf('\n')
                   const answer = newline < 0 ? result.message : result.message.slice(newline + 1)
                   if (!answer.trim()) return
-                  w.warn.push(`btw: ${clip(one(answer), 200)}`)
+                  pushWarning(w, `btw: ${clip(one(answer), 200)}`)
                   void sync()
                 })
                 .catch(() => undefined)
@@ -2286,6 +2338,11 @@ export const register: Register = on => {
     const after = [...new Set((Array.isArray(e.after) ? e.after : []).map(String))]
     const missing = after.filter(id => !workers.has(id))
     if (missing.length) return text(`unknown dependency worker id(s): ${missing.join(', ')}`, true)
+    const dependencyReports: Record<string, string> = {}
+    for (const dependencyId of after) {
+      const upstream = workers.get(dependencyId)
+      if (upstream?.state === 'done') dependencyReports[dependencyId] = dependencyResult(upstream)
+    }
     if (sessionBudget !== undefined) {
       const spent = (await read($, ledgerAtom)).cost
       if (spent >= sessionBudget) return text(`session budget exceeded: spent ${money(spent)} of ${money(sessionBudget)}; /pi-budget off or raise the cap before spawning`, true)
@@ -2309,8 +2366,6 @@ export const register: Register = on => {
     if (!(await insideRoots(dir))) {
       return text(`dir ${dir} is outside the allowed roots (${roots().filter(Boolean).join(', ')}) or is a protected dir`, true)
     }
-    seq += 1
-    const id = `w${seq}`
     const top = await $.process
       .run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: 10_000 })
       .catch(() => undefined)
@@ -2319,7 +2374,6 @@ export const register: Register = on => {
     if (kind.tools?.includes('edit') !== false && e.noDict !== true) {
       const have = Object.keys(((await $.store.get(DICT_PREFIX + (isGit ? top!.stdout.trim() : dir)).catch(() => undefined)) as object | undefined) ?? {}).length
       if (!have) {
-        seq -= 1
         return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, conventions, what workers must not touch. Put the checks workers should run themselves (tests, compile) in pi_tools, not the dictionary. Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
       }
     }
@@ -2329,7 +2383,6 @@ export const register: Register = on => {
         if (other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
         const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
         if (overlap) {
-          seq -= 1
           return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
         }
       }
@@ -2338,11 +2391,9 @@ export const register: Register = on => {
     if (Array.isArray(e.skills) && e.skills.length) {
       const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
       if (r.missing.length) {
-        seq -= 1
         return text(unknownSkills(r.missing, r.catalog), true)
       }
       if (r.found.length > MAX_SKILLS) {
-        seq -= 1
         return text(`${r.found.length} skills; push at most ${MAX_SKILLS} (the ones this task actually touches)`, true)
       }
       skills = r.found
@@ -2354,17 +2405,18 @@ export const register: Register = on => {
         checks = (e.checks as unknown[]).map(String)
         const unknown = checks.filter(n => !tools.checks[n])
         if (unknown.length) {
-          seq -= 1
           return text(`unknown check(s) ${unknown.join(', ')}; the toolbox for ${projRoot} has: ${Object.keys(tools.checks).join(', ') || 'nothing (add some with pi_tools set)'}`, true)
         }
       } else checks = Object.entries(tools.checks).filter(([, c]) => c.required).map(([n]) => n)
     }
+    const wantTree = e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
+    if (wantTree && !isGit) return text('worktree requested but dir is not a git repo', true)
+    seq += 1
+    const id = `w${seq}`
     let worktree: string | undefined
     let branch: string | undefined
     let sub: string | undefined
-    const wantTree = e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
     if (wantTree) {
-      if (!isGit) return text('worktree requested but dir is not a git repo', true)
       const root = top!.stdout.trim()
       const parent = root.slice(0, root.lastIndexOf('/')) || '/'
       const name = root.slice(root.lastIndexOf('/') + 1)
@@ -2390,6 +2442,15 @@ export const register: Register = on => {
         await $.process.run(['rm', '-f', `${path}${tools.sub}/Library/EditorInstance.json`], { timeoutMs: 10_000 }).catch(() => undefined)
       }
     }
+    for (const dependencyId of after) {
+      if (dependencyReports[dependencyId] !== undefined) continue
+      const upstream = workers.get(dependencyId)
+      if (upstream?.state === 'done') dependencyReports[dependencyId] = dependencyResult(upstream)
+      else {
+        const snapshot = dependencySnapshots.get(dependencyId)
+        if (snapshot !== undefined) dependencyReports[dependencyId] = snapshot
+      }
+    }
     const w: Worker = {
       id,
       title: String(e.title ?? clip(one(task), 40)),
@@ -2397,6 +2458,7 @@ export const register: Register = on => {
       sessionId: sid,
       pathKey: id,
       after: after.length ? after : undefined,
+      dependencyReports: Object.keys(dependencyReports).length ? dependencyReports : undefined,
       queuedReason: after.some(dep => workers.get(dep)?.state !== 'done')
         ? `waiting for dependencies: ${after.filter(dep => workers.get(dep)?.state !== 'done').join(', ')}`
         : 'waiting for a worker slot',
@@ -2640,21 +2702,43 @@ export const register: Register = on => {
       : [...workers.values()].filter(w => w.state === 'running' || w.state === 'queued').map(w => w.id)
     const list = ids.map(i => workers.get(i)).filter((w): w is Worker => !!w)
     if (!list.length) return text('nothing to wait for')
-    const limitMs = Math.min(Math.max(Number(e.timeoutSec ?? 60), 1), 90) * 1000
-    const start = Date.now()
-    const any = e.mode === 'any'
-    for (;;) {
-      const done = list.filter(w => w.state !== 'running' && w.state !== 'queued')
-      if (any ? done.length > 0 : done.length === list.length) break
-      if (Date.now() - start >= limitMs) break
-      // $.clock.sleep would spend the hook's 10 s budget; a $ call in flight does not.
-      await $.process.run(['sleep', '1'], { timeoutMs: 5000 }).catch(() => undefined)
-      if (next.signal.aborted) break
+    const asked = Number(e.timeoutSec ?? 300)
+    const limitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 300, 1), 900) * 1000
+    const mode = e.mode === 'all' || e.mode === 'any' ? e.mode : 'first'
+    const watched = list.map(w => ({ w, wasQueued: w.state === 'queued', warningCount: w.warn.length }))
+    const changed = () => watched.filter(({ w, wasQueued, warningCount }) => firstWaitChanged(w.state, wasQueued, w.warn.length, warningCount)).map(({ w }) => w)
+    const done = () => list.filter(w => w.state !== 'running' && w.state !== 'queued')
+    const shouldReturn = () => mode === 'first' ? changed().length > 0 : mode === 'any' ? done().length > 0 : done().length === list.length
+    if (!shouldReturn()) {
+      await new Promise<void>(resolve => {
+        let timer: { cancel: () => void } | undefined
+        const cleanup = () => {
+          waitListeners.delete(onChange)
+          timer?.cancel()
+          next.signal.removeEventListener('abort', complete)
+        }
+        const complete = () => {
+          cleanup()
+          resolve()
+        }
+        const onChange = () => { if (shouldReturn()) complete() }
+        waitListeners.add(onChange)
+        timer = $.clock.after(limitMs, complete)
+        next.signal.addEventListener('abort', complete, { once: true })
+        if (next.signal.aborted) complete()
+        else onChange()
+      })
     }
+    const changedWorkers = changed()
+    const selected = mode === 'first' && changedWorkers.length ? changedWorkers : list
     const parts: string[] = []
-    for (const w of list) {
+    for (const w of selected) {
       if (w.state !== 'running' && w.state !== 'queued') {
         w.isReported = true
+        parts.push(await digest(w))
+        continue
+      }
+      if (mode === 'first' && changedWorkers.length > 0) {
         parts.push(await digest(w))
         continue
       }
@@ -2681,8 +2765,15 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_send' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    const interrupt = e.interrupt === true
-    if (w.state === 'running' && !interrupt) return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
+    const previousLock = w.launchLock ?? Promise.resolve()
+    let releaseLock!: () => void
+    const lock = new Promise<void>(resolve => { releaseLock = resolve })
+    w.launchLock = lock
+    await previousLock
+    try {
+      const interrupt = e.interrupt === true
+      if (w.state === 'running' && !interrupt) return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
+      if (w.state === 'running' && interrupt && w.verifying) return text(`${w.id} is verifying; wait for verification to finish before interrupting it`, true)
     if (!w.send && !w.session && !w.restored && !w.interruptedQueued) return text(`${w.id} has no live process or session id to continue`, true)
     if (!w.send && !w.session && w.interruptedQueued && (w.after ?? []).some(id => workers.get(id)?.state !== 'done')) {
       return text(`${w.id} was queued behind dependencies; finish ${w.after!.filter(id => workers.get(id)?.state !== 'done').join(', ')} before resuming it`, true)
@@ -2740,6 +2831,15 @@ export const register: Register = on => {
       if (!settled) return text(`${w.id} did not settle within 15 seconds after abort; no prompt was sent`, true)
       if (!w.send) return text(`${w.id} settled but its Pi process stopped; no prompt was sent to a different process`, true)
     }
+    if (w.state === 'running') return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
+    if (running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers; pi_send follow-ups are not queued (they resume an existing session), so wait for a slot and try again`, true)
+    if (w.owns?.length) {
+      for (const other of workers.values()) {
+        if (other === w || other.root !== w.root || (other.state !== 'running' && other.state !== 'queued') || !other.owns?.length) continue
+        const overlap = w.owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
+        if (overlap) return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
+      }
+    }
     w.texts = []
     w.errors = []
     const prompt = !w.send && !w.session
@@ -2747,7 +2847,12 @@ export const register: Register = on => {
       : message
     B?.launch(w, added.length && w.send ? `Your supervisor attached ${added.length === 1 ? 'a skill' : 'skills'} for this follow-up. Read each SKILL.md before you work in its area and follow its patterns:\n${skillsText(added)}\n\n${message}` : prompt)
     await sync()
-    return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}${added.length ? `; skills added: ${added.map(s => s.name).join(', ')}` : ''}`)
+      return text(`sent to ${w.id}${w.send ? ' (same process, context kept)' : ' (process was stopped; resuming its saved session)'}${added.length ? `; skills added: ${added.map(s => s.name).join(', ')}` : ''}`)
+    } finally {
+      if (w.interrupting) w.interrupting = false
+      releaseLock()
+      if (w.launchLock === lock) w.launchLock = undefined
+    }
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_diff' }, async ($, e) => {
@@ -2802,6 +2907,7 @@ export const register: Register = on => {
       w.endedAt = Date.now()
       w.last = 'removed from the spawn queue'
       scheduleQueue()
+      notifyWaiters()
       void B?.finished(w)
       return text(`removed queued worker ${w.id}`)
     }
@@ -2876,25 +2982,32 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state === 'running') return text(`${w.id} is still running; pi_kill it first`, true)
     if (!B) return text('not ready', true)
-    if (w.state === 'queued') {
-      w.killed = true
-      w.state = 'killed'
-      w.endedAt = Date.now()
-      w.last = 'removed from spawn queue for cleanup'
-      scheduleQueue()
-      void B.finished(w)
-    }
+    if (w.state === 'queued') w.cleanupPending = true
     if (w.worktree && w.branch) {
       if (e.force !== true) {
         const dirty = await B.git(['status', '--porcelain'], w.worktree)
         const ahead = await B.git(['rev-list', '--count', `HEAD..${w.branch}`], w.dir)
         if (dirty?.stdout.trim() || Number(ahead?.stdout.trim() ?? 0) > 0) {
+          w.cleanupPending = false
           return text(`${w.id} has unmerged work; pi_merge it first or pass force:true`, true)
         }
       }
       const rm = await B.git(['worktree', 'remove', '--force', w.worktree], w.dir)
-      if (rm?.exitCode !== 0) return text(`worktree remove failed: ${rm?.stderr.trim()}`, true)
+      if (rm?.exitCode !== 0) {
+        w.cleanupPending = false
+        return text(`worktree remove failed: ${rm?.stderr.trim()}`, true)
+      }
       await B.git(['branch', '-D', w.branch], w.dir)
+    }
+    if (w.state === 'queued') {
+      w.cleanupPending = false
+      w.killed = true
+      w.state = 'killed'
+      w.endedAt = Date.now()
+      w.last = 'removed from spawn queue for cleanup'
+      scheduleQueue()
+      notifyWaiters()
+      void B.finished(w)
     }
     w.stop?.()
     const leftovers = [workerTmpDir(agentDir, w, sid), w.snapDir, w.marker, w.btwDir, workerCommandFile(agentDir, w, sid)].filter((path): path is string => !!path)
