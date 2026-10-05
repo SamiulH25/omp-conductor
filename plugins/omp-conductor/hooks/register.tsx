@@ -3,6 +3,96 @@ import type { Register } from 'claude-code'
 
 import type { Act, WorkerView as WorkerViewBase } from '../types'
 
+const stable = (value: any): any => {
+  if (Array.isArray(value)) return value.map(stable)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])]))
+  }
+  return value
+}
+
+const signature = (event: any) => `${event.tool ?? 'tool'}\0${JSON.stringify(stable(event.args ?? {}))}`
+
+function detectStuck(
+  events: { kind: string; tool?: string; args?: Record<string, unknown>; text?: string }[],
+  quietMs: number,
+  thresholdMs = 4 * 60_000,
+) {
+  const findings = []
+  if (quietMs >= thresholdMs) {
+    findings.push({ key: 'idle', message: `possibly stuck: no activity for ${Math.floor(quietMs / 60_000)}m` })
+  }
+
+  const calls = events.filter(event => event.kind === 'tool').slice(-8)
+  const counts = new Map()
+  for (const event of calls) {
+    const key = signature(event)
+    const previous = counts.get(key)
+    if (previous) previous.count += 1
+    else counts.set(key, { event, count: 1 })
+  }
+  for (const [key, { event, count }] of counts) {
+    if (count < 4) continue
+    const args = event.args ?? {}
+    const detail = typeof args.command === 'string' ? JSON.stringify(args.command) : JSON.stringify(args)
+    findings.push({
+      key: `tool:${key}`,
+      message: `looping: ${event.tool ?? 'tool'} ${detail} x${count}`,
+    })
+  }
+
+  const errors = events.filter(event => event.kind === 'error')
+  const errorCounts = new Map()
+  for (const event of errors) {
+    const text = String(event.text ?? 'error')
+    errorCounts.set(text, (errorCounts.get(text) ?? 0) + 1)
+  }
+  for (const [text, count] of errorCounts) {
+    if (count >= 3) findings.push({ key: `error:${text}`, message: `looping: error ${JSON.stringify(text)} x${count}` })
+  }
+  return findings
+}
+
+// Inline copies are needed because the hook loader may not resolve runtime relative imports.
+// extensions/owns.ts is the tested copy used by guard.ts; keep these helpers in sync with it.
+const normalize = (path: string) => path.replace(/\\/g, '/').replace(/^\.\//, '')
+
+function matchesGlob(pattern: string, path: string): boolean {
+  const glob = normalize(pattern)
+  const file = normalize(path)
+  let source = '^'
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i]!
+    if (ch === '*' && glob[i + 1] === '*') {
+      i++
+      if (glob[i + 1] === '/') {
+        i++
+        source += '(?:.*/)?'
+      } else source += '.*'
+    } else if (ch === '*') source += '[^/]*'
+    else if (ch === '?') source += '[^/]'
+    else source += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`${source}$`).test(file)
+}
+
+function matchesAny(patterns: readonly string[], path: string): boolean {
+  return patterns.some(pattern => matchesGlob(pattern, path))
+}
+
+function patternsOverlap(a: string, b: string): boolean {
+  const left = normalize(a)
+  const right = normalize(b)
+  const leftWildcard = /[*?]/.test(left)
+  const rightWildcard = /[*?]/.test(right)
+  if (!leftWildcard && !rightWildcard) return left === right
+  const prefix = (pattern: string) => pattern.slice(0, pattern.search(/[*?]/) < 0 ? pattern.length : pattern.search(/[*?]/))
+  const lp = prefix(left)
+  const rp = prefix(right)
+  if (!lp || !rp) return true
+  return lp.startsWith(rp) || rp.startsWith(lp)
+}
+
 const PANE = 'omp-conductor'
 const MAX_WORKERS = 4
 const MAX_EVENTS = 300
@@ -206,6 +296,13 @@ const AGENTS: Record<string, AgentType> = {
   },
 }
 const DEFAULT_AGENT = 'general'
+const AGENT_TYPES = ['general', 'dev', 'explore', 'review'] as const
+type ModelAgentType = (typeof AGENT_TYPES)[number]
+type ModelOverrides = Partial<Record<ModelAgentType, string>>
+const resolveWorkerModel = (agent: string, codex: boolean, codexModel: string, overrides: ModelOverrides, globalModel: string, pinnedCodexModel?: string) =>
+  codex ? pinnedCodexModel ?? codexModel : overrides[agent as ModelAgentType] ?? globalModel
+const budgetThreshold = (cost: number, cap?: number): 'none' | 'warning' | 'exceeded' =>
+  !cap || cap <= 0 || cost <= 0 ? 'none' : cost >= cap ? 'exceeded' : cost >= cap * 0.8 ? 'warning' : 'none'
 const REPORT_CHARS = 60000 // a detailed report is shown whole; this is only a runaway guard (~15k tokens)
 const REPORT_CHARS_FULL = 200000 // ... with detail:"full", and the most the store keeps
 
@@ -248,6 +345,12 @@ type Worker = {
   errors: string[]
   texts: string[]
   events: string[]
+  eventTotal?: number
+  recentActivity?: { kind: 'tool' | 'error'; tool?: string; args?: Record<string, unknown>; text?: string }[]
+  stuckKeys?: string[]
+  interruptedRun?: string
+  interrupting?: boolean
+  settleWaiters?: (() => void)[]
   last: string
   steps: number
   tokensIn: number
@@ -278,6 +381,7 @@ type Worker = {
   effortSent?: string
   codex?: boolean // pinned to the /codex-worker model and effort at spawn, for its whole life, resumes included
   skills?: Skill[] // skills the supervisor pushed (pi_spawn / pi_send): --skill on every process start
+  owns?: string[] // file glob patterns this worker may edit
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
   snapDir?: string // non-git dirs: originals of files the worker edited (written by the guard extension)
   btwDir?: string
@@ -296,6 +400,9 @@ type Worker = {
   genMs: number
   spark: number[]
   maxMinutes?: number
+  maxCost?: number
+  budgetWarned?: boolean
+  sessionBudgetWarned?: boolean
   cost: number
   sawEnd: boolean
   turnChars: number
@@ -320,7 +427,7 @@ type Bridge = {
   realPath: (dir: string) => Promise<string | undefined>
   wake: (id: string) => void
   flush: () => void
-  ledger: (cost: number, tokens: number, spawned: number) => Promise<void>
+  ledger: (cost: number, tokens: number, spawned: number, worker?: Worker) => Promise<void>
 }
 
 type Species = { color: string; rows: (eyes: string, mouth: string) => string[] }
@@ -494,6 +601,9 @@ export const register: Register = on => {
   let turnActive = false
   let demoOn = false
   let currentModel = DEFAULT_MODEL
+  let modelOverrides: ModelOverrides = {}
+  let sessionBudget: number | undefined
+  let sessionBudgetWarned = false
   let currentThinking = DEFAULT_THINKING
   let codexModel = CODEX_MODEL
   let codexThinking = CODEX_THINKING
@@ -596,13 +706,13 @@ export const register: Register = on => {
     w.soft = undefined
     w.grace?.cancel()
     w.grace = undefined
-    if (w.timedOut && !w.killed && !w.runError) {
+    if (w.timedOut && !w.killed && !w.interrupting && !w.runError) {
       w.runError = `time limit (${w.maxMinutes ?? 20}m) reached; the worker was asked for a partial report (its last message)`
       w.errors.push(w.runError)
     }
     const next = w.killed ? 'killed' : w.runError ? 'failed' : 'done'
     // A verify command runs before the worker counts as done; a failure can go back to the worker as a fix round.
-    if (next === 'done' && w.verify && !w.verifyDone) {
+    if (next === 'done' && !w.interrupting && w.verify && !w.verifyDone) {
       if (w.verifying) return
       w.verifying = true
       w.act = 'bash'
@@ -612,14 +722,24 @@ export const register: Register = on => {
     }
     w.endedAt = Date.now()
     w.state = next
-    scheduleQueue()
+    if (!w.interrupting) scheduleQueue()
+    if (w.interrupting) w.interrupting = false
+    for (const settled of w.settleWaiters ?? []) settled()
+    w.settleWaiters = []
     void B?.finished(w)
   }
 
   // ---------------------------------------------------------------- parsing
   const note = (w: Worker, line: string) => {
     w.events.push(clip(one(line), 200))
+    w.eventTotal = (w.eventTotal ?? 0) + 1
     if (w.events.length > MAX_EVENTS) w.events.shift()
+  }
+
+  const rememberActivity = (w: Worker, event: NonNullable<Worker['recentActivity']>[number]) => {
+    const recent = (w.recentActivity ??= [])
+    recent.push(event)
+    if (recent.length > 24) recent.shift()
   }
 
   const actOf = (tool: string): Act => {
@@ -692,6 +812,8 @@ export const register: Register = on => {
         else if (ev.success === false && ev.command !== 'get_state') {
           w.runError = clip(one(String(ev.error ?? `${ev.command} failed`)), 200)
           w.errors.push(`${ev.command}: ${w.runError}`)
+          rememberActivity(w, { kind: 'error', text: w.runError })
+          note(w, `ERR ${ev.command} ${w.runError}`)
         }
         break
       case 'turn_start':
@@ -734,6 +856,7 @@ export const register: Register = on => {
       case 'tool_execution_start': {
         const args = (ev.args ?? {}) as Record<string, unknown>
         w.toolArgs[String(ev.toolCallId)] = args
+        rememberActivity(w, { kind: 'tool', tool: String(ev.toolName ?? 'tool'), args })
         w.act = actOf(String(ev.toolName ?? ''))
         w.last = clip(one(`▶ ${ev.toolName} ${ev.intent ?? target(args) ?? args.command ?? ''}`), 80)
         break
@@ -754,7 +877,9 @@ export const register: Register = on => {
           w.commands.push(cmd)
           const exit = ev.result?.details?.exitCode ?? /exit(?:ed)?(?: with)?(?: code)?[: ]+(\d+)/i.exec(out)?.[1]
           if (exit != null && Number(exit) !== 0) {
-            w.errors.push(`bash exit ${exit}: ${clip(one(cmd), 80)}`)
+            const failure = `bash exit ${exit}: ${clip(one(cmd), 80)}`
+            w.errors.push(failure)
+            rememberActivity(w, { kind: 'error', text: failure })
             react(w, 'error')
           }
         }
@@ -765,8 +890,9 @@ export const register: Register = on => {
           react(w, 'error')
           const msg = clip(one(out || 'error'), 200)
           w.errors.push(`${tool}: ${msg}`)
-          note(w, `ERR ${tool} ${msg}`)
-        } else note(w, `${tool} ${file ?? clip(cmd ?? '', 80)}`)
+          rememberActivity(w, { kind: 'error', text: msg })
+          note(w, `ERR ${tool} ${clip(one(JSON.stringify(args)), 80)} ${msg}`)
+        } else note(w, `TOOL ${tool} ${clip(one(JSON.stringify(args)), 110)}`)
         break
       }
       case 'turn_end': {
@@ -779,7 +905,7 @@ export const register: Register = on => {
         w.tokensOut += gen
         const cost = Number(u.cost?.total ?? 0)
         w.cost += cost
-        void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0)
+        void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0, w)
         // Exact decode speed for the turn: generated tokens over time after the first token.
         const decodeMs = m.duration != null ? Number(m.duration) - Number(m.ttft ?? 0) : w.firstAt ? Date.now() - w.firstAt : 0
         if (gen > 0 && decodeMs >= 150) {
@@ -799,9 +925,11 @@ export const register: Register = on => {
         const m = ev.message ?? {}
         if (m.role === 'assistant' && (m.stopReason === 'error' || m.stopReason === 'aborted')) {
           const why = clip(one(String(m.errorMessage ?? m.stopReason)), 200)
-          if (m.stopReason === 'error' || (m.stopReason === 'aborted' && !w.killed && !w.runError)) {
+          if (!w.interrupting && (m.stopReason === 'error' || (m.stopReason === 'aborted' && !w.killed && !w.runError))) {
             w.runError = m.stopReason === 'aborted' ? 'aborted by Pi' : why
             w.errors.push(`model: ${w.runError}`)
+            rememberActivity(w, { kind: 'error', text: w.runError })
+            note(w, `ERR model ${w.runError}`)
             react(w, 'error')
           }
         }
@@ -823,10 +951,11 @@ export const register: Register = on => {
   const digest = async (w: Worker, full = false) => {
     const lines: string[] = []
     const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
-    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}`)
+    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}` + (w.owns !== undefined ? ` owns=${w.owns.join(', ') || '(none)'}` : ''))
     if (w.state === 'queued') lines.push(`queue: ${w.queuedReason ?? 'waiting for a worker slot'}`)
     if (w.after?.length) lines.push(`depends on: ${w.after.join(', ')}`)
     lines.push(`dir: ${workDir(w)}${w.worktree ? ' (worktree)' : ''}`)
+    if (w.interruptedRun) lines.push(`previous run interrupted: ${w.interruptedRun}`)
     const files = [...w.files]
     if (files.length) {
       lines.push(
@@ -855,7 +984,7 @@ export const register: Register = on => {
     }
     if (w.state !== 'running' && w.stderr.trim()) lines.push(`stderr: ${clip(one(w.stderr), 300)}`)
     const avg = w.genMs > 0 ? `, ~${Math.round(w.outTokens / (w.genMs / 1000))} tok/s` : ''
-    lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
+    lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.maxCost ? ` / ${money(w.maxCost)} worker budget` : ''}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
     for (const x of w.warn) lines.push(`⚠ ${x}`)
     if (w.checkRuns?.length) lines.push(`checks run: ${w.checkRuns.map(c => `${c.name} ${c.ok ? 'PASS' : `FAIL(${c.exit})`} ${c.secs}s`).join(', ')}`)
     else if (w.checks?.length && w.state !== 'running') lines.push(`checks run: none (required: ${w.checks.join(', ')})`)
@@ -1038,6 +1167,11 @@ export const register: Register = on => {
 
     currentModel = String((await $.store.get('model').catch(() => undefined)) || DEFAULT_MODEL)
     await update($, modelAtom, () => currentModel)
+    const savedOverrides = (await $.store.get('modelOverrides').catch(() => undefined)) as ModelOverrides | undefined
+    modelOverrides = Object.fromEntries(AGENT_TYPES.filter(type => typeof savedOverrides?.[type] === 'string').map(type => [type, savedOverrides![type]])) as ModelOverrides
+    const savedBudget = await $.store.get('budget').catch(() => undefined)
+    sessionBudget = typeof savedBudget === 'number' && Number.isFinite(savedBudget) && savedBudget > 0 ? savedBudget : undefined
+    sessionBudgetWarned = false
     const savedThinking = String((await $.store.get('thinking').catch(() => undefined)) || DEFAULT_THINKING)
     currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
     await update($, thinkingAtom, () => currentThinking)
@@ -1065,6 +1199,7 @@ export const register: Register = on => {
       effort: w.effort,
       codex: w.codex,
       skills: w.skills,
+      owns: w.owns,
       marker: w.marker,
       snapDir: w.snapDir,
       btwAt: w.btwAt,
@@ -1083,6 +1218,11 @@ export const register: Register = on => {
       reads: [...w.reads].slice(0, 200),
       commands: w.commands.slice(-10),
       errors: w.errors.slice(-5),
+      events: w.events,
+      eventTotal: w.eventTotal,
+      recentActivity: w.recentActivity,
+      stuckKeys: w.stuckKeys,
+      interruptedRun: w.interruptedRun,
       last: w.last,
       steps: w.steps,
       tokensIn: w.tokensIn,
@@ -1093,6 +1233,7 @@ export const register: Register = on => {
       genMs: w.genMs,
       spark: w.spark,
       maxMinutes: w.maxMinutes,
+      maxCost: w.maxCost,
       cost: w.cost,
     })
 
@@ -1110,7 +1251,11 @@ export const register: Register = on => {
           files: new Set(r.files),
           reads: new Set(r.reads ?? []),
           texts: r.finalText ? [r.finalText] : [],
-          events: [],
+          events: r.events ?? [],
+          eventTotal: r.eventTotal ?? r.events?.length ?? 0,
+          recentActivity: r.recentActivity ?? [],
+          stuckKeys: r.stuckKeys ?? [],
+          interruptedRun: r.interruptedRun,
           stderr: '',
           state: was ? 'killed' : r.state,
           last: was ? 'interrupted by a reload' : r.last,
@@ -1174,12 +1319,54 @@ export const register: Register = on => {
         return r.isAnswered ? r.text.trim() : undefined
       },
 
-      ledger: async (cost, tokens, spawned) => {
+      ledger: async (cost, tokens, spawned, worker) => {
         await update($, ledgerAtom, l => ({
           cost: (l?.cost ?? 0) + cost,
           tokens: (l?.tokens ?? 0) + tokens,
           spawned: (l?.spawned ?? 0) + spawned,
         }))
+        if (worker) {
+          const level = budgetThreshold(worker.cost, worker.maxCost)
+          if (level === 'warning' && !worker.budgetWarned) {
+            worker.budgetWarned = true
+            const warning = `worker budget warning: ${money(worker.cost)} of ${money(worker.maxCost!)} (80% reached)`
+            worker.warn.push(warning)
+            void sync()
+            void worker.send?.({ type: 'steer', message: `Budget check: you have used at least 80% of your $${worker.maxCost!.toFixed(2)} worker budget. Keep remaining work concise and report what is complete.` })
+          } else if (level === 'exceeded' && worker.state === 'running') {
+            const reason = `budget exceeded: worker spent ${money(worker.cost)} of ${money(worker.maxCost!)}`
+            worker.killed = true
+            worker.runError = reason
+            worker.errors.push(reason)
+            void worker.send?.({ type: 'abort' })
+            worker.stop?.()
+            finish(worker)
+          }
+        }
+        const total = (await read($, ledgerAtom)).cost
+        const sessionLevel = budgetThreshold(total, sessionBudget)
+        if (sessionLevel === 'warning' && !sessionBudgetWarned) {
+          sessionBudgetWarned = true
+          for (const w of workers.values()) {
+            if (w.state !== 'running') continue
+            const warning = `session budget warning: ${money(total)} of ${money(sessionBudget!)} (80% reached)`
+            if (!w.warn.includes(warning)) w.warn.push(warning)
+            w.sessionBudgetWarned = true
+            void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
+          }
+          void sync()
+        } else if (sessionLevel === 'exceeded') {
+          for (const w of workers.values()) {
+            if (w.state !== 'running') continue
+            const reason = `budget exceeded: session spent ${money(total)} of ${money(sessionBudget!)}`
+            w.killed = true
+            w.runError = reason
+            w.errors.push(reason)
+            void w.send?.({ type: 'abort' })
+            w.stop?.()
+            finish(w)
+          }
+        }
       },
 
       sync: async () => {
@@ -1198,7 +1385,7 @@ export const register: Register = on => {
         $.ui.status(
           all.length === 0 && !led.spawned
             ? undefined
-            : `pi ${n('running')} running · ${n('queued')} queued · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
+            : `pi ${n('running')} running · ${n('queued')} queued · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}${sessionBudget ? ` · budget ${money(led.cost)}/${money(sessionBudget)}${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''}`,
         )
       },
 
@@ -1254,13 +1441,47 @@ export const register: Register = on => {
         w.verifyDone = false
         w.runError = undefined
         w.warn = []
+        const workerBudget = budgetThreshold(w.cost, w.maxCost)
+        if (workerBudget === 'warning') w.warn.push(`worker budget warning: ${money(w.cost)} of ${money(w.maxCost!)} (80% reached)`)
+        if (workerBudget === 'exceeded') {
+          const reason = `budget exceeded: worker spent ${money(w.cost)} of ${money(w.maxCost!)}`
+          w.killed = true
+          w.runError = reason
+          w.errors.push(reason)
+          void w.send?.({ type: 'abort' })
+          w.stop?.()
+          finish(w)
+          return
+        }
+        w.stuckKeys = []
+        w.recentActivity = []
+        w.lastAt = Date.now()
         w.win = []
         w.live = ''
         w.act = 'think'
         w.last = w.steps > 0 ? `follow-up: ${clip(one(message), 60)}` : 'starting'
         void (async () => {
           const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+          const sessionSpent = (await read($, ledgerAtom)).cost
+          if (budgetThreshold(sessionSpent, sessionBudget) === 'exceeded') {
+            const reason = `budget exceeded: session spent ${money(sessionSpent)} of ${money(sessionBudget!)}`
+            w.killed = true
+            w.runError = reason
+            w.errors.push(reason)
+            void w.send?.({ type: 'abort' })
+            w.stop?.()
+            finish(w)
+            return
+          }
           if (!w.send && !(await startProc(w))) return
+          if (budgetThreshold(sessionSpent, sessionBudget) === 'warning') {
+            const warning = `session budget warning: ${money(sessionSpent)} of ${money(sessionBudget!)} (80% reached)`
+            if (!w.warn.includes(warning)) w.warn.push(warning)
+            if (!w.sessionBudgetWarned) {
+              w.sessionBudgetWarned = true
+              void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
+            }
+          }
           if (w.effort && w.effortSent !== w.effort) {
             w.effortSent = w.effort
             await w.send?.({ type: 'set_thinking_level', level: w.effort })
@@ -1404,6 +1625,7 @@ export const register: Register = on => {
       TMPDIR: tmpDir(w), // scratch files stay out of the project and out of /tmp
       ...(w.snapDir ? { PI_SNAPSHOT_DIR: w.snapDir } : {}),
       ...(w.worktree ? { PI_MAIN_ROOT: w.root, PI_WORK_ROOT: w.worktree } : {}), // the guard keeps the worker inside its worktree
+      ...(w.owns !== undefined ? { PI_OWNS: JSON.stringify(w.owns) } : {}),
       PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`, // the `check` runner
       PI_CHECKS_FILE: `${tmpDir(w)}/checks.json`,
       PI_CHECKS_REQUIRED: (w.checks ?? []).join(','), // the guard asks for these after the last edit
@@ -1420,9 +1642,9 @@ export const register: Register = on => {
       await $.fs.write(file, '').catch(() => undefined)
       await $.fs.write(`${w.btwDir}/.keep`, '').catch(() => undefined)
       await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
-      w.model = w.codex ? w.model || codexModel : currentModel
+      w.model = resolveWorkerModel(w.agent, !!w.codex, codexModel, modelOverrides, currentModel, w.model)
       const args = [
-        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', w.model, '--thinking', w.effort ?? currentThinking,
+        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', w.model!, '--thinking', w.effort ?? currentThinking,
         '--offline', '-ne', '-ns', '-np', '-nc', '-na',
       ]
       args.push('-e', `${$.plugin.root}/extensions/guard.ts`)
@@ -1525,7 +1747,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_spawn',
       description:
-        'Start a Pi worker in the background on a self-contained task and return its id at once; if all worker slots are occupied or its after dependencies are unfinished, it queues FIFO and pi_spawn reports its position. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once; if all worker slots are occupied or its after dependencies are unfinished, it queues FIFO and pi_spawn reports its position. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs, worktree isolation, or owns patterns to avoid merge conflicts between parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
@@ -1538,10 +1760,12 @@ export const register: Register = on => {
             description: `Agent type (default ${DEFAULT_AGENT}). ${Object.entries(AGENTS).map(([k, a]) => `${k}: ${a.about}`).join('; ')}`,
           },
           maxMinutes: { type: 'number', description: 'time limit for the run (default depends on agent type, 15-20). At 85% the worker is told to wrap up; at 100% it is asked for a partial report and gets 2 more minutes before it is stopped. pi_send can resume it.' },
+          maxCost: { type: 'number', description: 'Optional per-worker USD budget. At 80% the worker gets a budget-check steer; at 100% it is killed with the budget-exceeded reason and its partial work remains available to pi_diff. Flat-rate use that reports $0 does not trip it.' },
           checks: { type: 'array', items: { type: 'string' }, description: 'Toolbox checks (pi_tools) the worker must run and pass after its last edit. Default: the toolbox entries marked required. [] = none for this task. The worker runs them itself with `check <name>`; serial ones never run twice at once.' },
           verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Prefer toolbox checks (pi_tools), which the worker runs and fixes itself; use verify for a final gate the worker must not run. The result goes in the digest; a failure counts as a warning.' },
           verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
           fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
+          owns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns of files this worker may edit (relative to its dir/worktree root); use owned patterns so parallel workers avoid merge conflicts.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
           codex: { type: 'boolean', description: `Run this worker on Codex (the /codex-worker model, default ${CODEX_MODEL}, via the user's ChatGPT subscription) at the /codex-worker effort (default ${CODEX_THINKING}) instead of the /pi-model model; effort cannot be combined with it. Slower and stronger: use it for hard reasoning, tricky bugs and careful reviews, not routine edits.` },
@@ -1620,6 +1844,19 @@ export const register: Register = on => {
       ),
     })
     await $.tool.register({
+      name: 'pi_log',
+      description: 'Read a worker\'s compact recent activity log by event index, optionally filtered to tool, error, assistant, or other notes. The header reports the retained window and total logged events.',
+      inputSchema: obj(
+        {
+          ...idProp,
+          from: { type: 'number', description: 'Starting event index; defaults to the newest page.' },
+          count: { type: 'number', description: 'Number of entries (default 40, max 200).' },
+          kinds: { type: 'array', items: { type: 'string', enum: ['tool', 'error', 'assistant', 'other'] } },
+        },
+        ['id'],
+      ),
+    })
+    await $.tool.register({
       name: 'pi_wait',
       description:
         'Wait until the given workers (default: all running or queued) finish or timeoutSec passes (max 90 per call; call again to keep waiting), then return their digests.',
@@ -1645,11 +1882,12 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_send',
       description:
-        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes and for the next task in the same area instead of re-spawning (no re-reading, no re-learning the layout). Send only the new instruction; it already has the background. The worker must not be running. Follow-ups are refused rather than queued when all worker slots are occupied.',
+        'Send a follow-up message to a finished worker, or pass interrupt:true to abort a running worker and send the new prompt in the same process after it settles (up to 15 seconds). Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read. Follow-ups to finished workers are refused rather than queued when all worker slots are occupied.'
       inputSchema: obj(
         {
           ...idProp,
           message: { type: 'string' },
+          interrupt: { type: 'boolean', description: 'Abort a running worker, wait up to 15 seconds for it to settle, then send this as a new prompt in the same process. Required to redirect a running worker.' },
           maxMinutes: { type: 'number', description: 'New time limit for this run (use it to give a worker that hit its limit more time).' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Change this worker\'s reasoning effort from this message on.' },
           skills: { type: 'array', items: { type: 'string' }, description: 'More skills to push onto this worker (same naming as pi_spawn), when the follow-up moves into an area its current skills do not cover. Added to the ones it has.' },
@@ -1682,7 +1920,8 @@ export const register: Register = on => {
     })
 
     await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
-    await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
+    await $.command.register({ name: 'pi-model', description: 'Show or change the global or per-agent-type model Pi workers use' })
+    await $.command.register({ name: 'pi-budget', description: 'Show or change the session USD budget for Pi workers' })
     await $.command.register({ name: 'codex-worker', description: 'Show or change the Codex model and effort used by codex:true workers' })
     await $.command.register({ name: 'btw', description: 'Ask a running worker why it is slow or quiet without interrupting it' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
@@ -1693,8 +1932,34 @@ export const register: Register = on => {
       scheduleQueue()
       if (running() > 0) void sync()
       // An idle worker's process is stopped after a while; pi_send resumes its saved session.
+      const now = Date.now()
       for (const w of workers.values()) {
-        if (w.stop && w.state !== 'running' && w.endedAt && Date.now() - w.endedAt > IDLE_STOP_MS) w.stop()
+        if (w.state === 'running') {
+          const quietMs = now - (w.lastAt ?? w.startedAt)
+          let warned = false
+          for (const finding of detectStuck(w.recentActivity ?? [], quietMs)) {
+            const keys = (w.stuckKeys ??= [])
+            if (keys.includes(finding.key)) continue
+            keys.push(finding.key)
+            w.warn.push(finding.message)
+            warned = true
+            const askedAt = Date.now()
+            if (!w.btwPending && (w.btwCount ?? 0) < 5 && (!w.btwAt || askedAt - w.btwAt >= 30_000)) {
+              void askBtw($, w.id, `You may be stuck or looping (${finding.message}). What are you doing and what is blocking you?`, 45, false)
+                .then(result => {
+                  if (result.error) return
+                  const newline = result.message.indexOf('\n')
+                  const answer = newline < 0 ? result.message : result.message.slice(newline + 1)
+                  if (!answer.trim()) return
+                  w.warn.push(`btw: ${clip(one(answer), 200)}`)
+                  void sync()
+                })
+                .catch(() => undefined)
+            }
+          }
+          if (warned) void sync()
+        }
+        if (w.stop && w.state !== 'running' && w.endedAt && now - w.endedAt > IDLE_STOP_MS) w.stop()
       }
     })
     // The pane's animation clock: one tick per frame, only while a worker runs.
@@ -1723,22 +1988,38 @@ export const register: Register = on => {
 
   on('command.run', { command: 'pi-model' }, async ($, e) => {
     const arg = String((e as { args?: string }).args ?? '').trim()
-    const set = async (m: string) => {
+    const [first = '', ...rest] = arg.split(/\s+/)
+    const agentType = rest.length && AGENT_TYPES.includes(first as ModelAgentType) ? (first as ModelAgentType) : undefined
+    const queryArg = agentType ? rest.join(' ') : arg
+    const setGlobal = async (m: string) => {
       currentModel = m
       await $.store.set('model', m).catch(() => undefined)
       await update($, modelAtom, () => m)
     }
-    const status = `worker model: ${currentModel}${currentModel === DEFAULT_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_MODEL})`}`
-    if (!arg) {
-      return { text: `${status}\nChange it: /pi-model <provider/model or part of a name>. Reset: /pi-model reset. List: pi --list-models. Models other than the bundled one must exist in ~/${AGENT_DIR_NAME}/models.json or Pi's catalog.` }
+    const setOverride = async (type: ModelAgentType, m: string | undefined) => {
+      if (m) modelOverrides[type] = m
+      else delete modelOverrides[type]
+      await $.store.set('modelOverrides', modelOverrides).catch(() => undefined)
     }
-    if (arg === 'reset' || arg === 'default') {
-      await set(DEFAULT_MODEL)
+    const status = () => {
+      const global = `worker model: ${currentModel}${currentModel === DEFAULT_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_MODEL})`}`
+      const overrides = AGENT_TYPES.filter(type => modelOverrides[type]).map(type => `${type}: ${modelOverrides[type]}`)
+      return `${global}${overrides.length ? `\nper-agent overrides:\n${overrides.map(value => `  ${value}`).join('\n')}` : '\nper-agent overrides: none'}`
+    }
+    if (!arg) {
+      return { text: `${status()}\nChange global: /pi-model <provider/model or part of a name>. Change one type: /pi-model <agentType> <model>; clear: /pi-model <agentType> reset. List: pi --list-models. Models other than the bundled one must exist in ~/${AGENT_DIR_NAME}/models.json or Pi's catalog.` }
+    }
+    if (!agentType && (arg === 'reset' || arg === 'default')) {
+      await setGlobal(DEFAULT_MODEL)
       return { text: `worker model reset to ${DEFAULT_MODEL}. Applies to workers started or resumed from now on.` }
+    }
+    if (agentType && (queryArg === 'reset' || queryArg === 'default')) {
+      await setOverride(agentType, undefined)
+      return { text: `${agentType} model override cleared. It now uses ${modelOverrides[agentType] ?? currentModel}.` }
     }
     const notReady = await ensureSetup()
     if (notReady) return { text: notReady }
-    const query = arg.includes('/') ? arg.split('/').slice(1).join('/') : arg
+    const query = queryArg.includes('/') ? queryArg.split('/').slice(1).join('/') : queryArg
     // `pi --list-models <query>` prints a table: provider, model, context, ...
     const listed = await $.process
       .run(['pi', '--list-models', query], { env: { PI_CODING_AGENT_DIR: agentDir, OPENCODE_GO_API_KEY: apiKey }, timeoutMs: 30_000 })
@@ -1751,17 +2032,45 @@ export const register: Register = on => {
             .filter(c => c.length >= 2 && c[0] !== 'provider')
             .map(c => ({ selector: `${c[0]}/${c[1]}`, context: c[2] }))
         : undefined
-    if (!models) return { text: `could not read the model list from pi. ${status}` }
-    const exact = models.filter(m => m.selector === arg)
-    const hits = exact.length ? exact : models.filter(m => m.selector.includes(arg) || !arg.includes('/'))
-    if (!hits.length) return { text: `no pi model matches "${arg}". ${status}` }
+    if (!models) return { text: `could not read the model list from pi. ${status()}` }
+    const exact = models.filter(m => m.selector === queryArg)
+    const hits = exact.length ? exact : models.filter(m => m.selector.includes(queryArg) || !queryArg.includes('/'))
+    if (!hits.length) return { text: `no pi model matches "${queryArg}". ${status()}` }
     if (hits.length > 1) {
       const list = hits.slice(0, 10).map(m => `  ${m.selector}`).join('\n')
-      return { text: `${hits.length} models match "${arg}"; pass the exact selector:\n${list}${hits.length > 10 ? '\n  …' : ''}\n${status}` }
+      return { text: `${hits.length} models match "${queryArg}"; pass the exact selector:\n${list}${hits.length > 10 ? '\n  …' : ''}\n${status()}` }
     }
     const m = hits[0]!
-    await set(m.selector)
+    if (agentType) {
+      await setOverride(agentType, m.selector)
+      return { text: `${agentType} worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers of that type started or resumed from now on; running workers keep theirs.` }
+    }
+    await setGlobal(m.selector)
     return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
+  })
+
+  on('command.run', { command: 'pi-budget' }, async ($, e) => {
+    const arg = String((e as { args?: string }).args ?? '').trim()
+    const spent = (await read($, ledgerAtom)).cost
+    if (!arg) {
+      return { text: sessionBudget === undefined ? `session budget: off · spent ${money(spent)}\nSet it: /pi-budget <usd>; clear it: /pi-budget off.` : `session budget: ${money(spent)} of ${money(sessionBudget)}${budgetThreshold(spent, sessionBudget) === 'warning' ? ' · warning at 80%' : budgetThreshold(spent, sessionBudget) === 'exceeded' ? ' · exceeded' : ''}\nChange it: /pi-budget <usd>; clear it: /pi-budget off.` }
+    }
+    if (arg.toLowerCase() === 'off') {
+      sessionBudget = undefined
+      sessionBudgetWarned = false
+      for (const w of workers.values()) w.sessionBudgetWarned = false
+      await $.store.set('budget', null).catch(() => undefined)
+      await B?.ledger(0, 0, 0)
+      return { text: `session budget cleared · spent ${money(spent)}` }
+    }
+    const cap = Number(arg)
+    if (!Number.isFinite(cap) || cap <= 0) return { text: 'usage: /pi-budget <positive usd amount> | /pi-budget off' }
+    sessionBudget = cap
+    sessionBudgetWarned = false
+    for (const w of workers.values()) w.sessionBudgetWarned = false
+    await $.store.set('budget', cap).catch(() => undefined)
+    await B?.ledger(0, 0, 0)
+    return { text: `session budget set to ${money(cap)} · spent ${money(spent)}${budgetThreshold(spent, cap) === 'warning' ? ' · warning at 80%' : budgetThreshold(spent, cap) === 'exceeded' ? ' · exceeded; running workers stopped' : ''}` }
   })
 
   on('command.run', { command: 'btw' }, async ($, e) => {
@@ -1883,10 +2192,21 @@ export const register: Register = on => {
     const after = [...new Set((Array.isArray(e.after) ? e.after : []).map(String))]
     const missing = after.filter(id => !workers.has(id))
     if (missing.length) return text(`unknown dependency worker id(s): ${missing.join(', ')}`, true)
+    if (sessionBudget !== undefined) {
+      const spent = (await read($, ledgerAtom)).cost
+      if (spent >= sessionBudget) return text(`session budget exceeded: spent ${money(spent)} of ${money(sessionBudget)}; /pi-budget off or raise the cap before spawning`, true)
+    }
+    const owns = e.owns === undefined
+      ? undefined
+      : Array.isArray(e.owns) && e.owns.every((p: unknown) => typeof p === 'string' && p.trim())
+        ? (e.owns as string[]).map(p => p.trim())
+        : null
+    if (owns === null) return text('owns must be an array of non-empty glob patterns', true)
     const agent = String(e.agent ?? DEFAULT_AGENT)
     const kind = AGENTS[agent]
     if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
     if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+    if (e.maxCost !== undefined && (typeof e.maxCost !== 'number' || !Number.isFinite(e.maxCost) || e.maxCost <= 0)) return text('maxCost must be a positive USD number', true)
     const codex = e.codex === true
     if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
     if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
@@ -1910,6 +2230,16 @@ export const register: Register = on => {
       }
     }
     const projRoot = isGit ? top!.stdout.trim() : dir
+    if (owns?.length) {
+      for (const other of workers.values()) {
+        if (other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
+        const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
+        if (overlap) {
+          seq -= 1
+          return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
+        }
+      }
+    }
     let skills: Skill[] = []
     if (Array.isArray(e.skills) && e.skills.length) {
       const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
@@ -1980,9 +2310,10 @@ export const register: Register = on => {
       worktree,
       sub,
       branch,
-      model: codex ? codexModel : currentModel,
+      model: resolveWorkerModel(agent, codex, codexModel, modelOverrides, currentModel),
       codex: codex || undefined,
       skills: skills.length ? skills : undefined,
+      owns,
       agent,
       state: 'queued',
       startedAt: Date.now(),
@@ -2002,6 +2333,7 @@ export const register: Register = on => {
       genMs: 0,
       spark: [],
       maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
+      maxCost: typeof e.maxCost === 'number' ? e.maxCost : undefined,
       verify: typeof e.verify === 'string' && e.verify.trim() ? e.verify.trim() : undefined,
       verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
       fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
@@ -2150,15 +2482,15 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_status' }, async $ => {
     const led = await read($, ledgerAtom)
-    if (!workers.size) return text(`no workers · session ${money(led.cost)}`)
+    if (!workers.size) return text(`no workers · session ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''}`)
     return text(
       [...workers.values()]
         .map(w => {
           const r = (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps
           const position = w.state === 'queued' ? [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === w.id) + 1 : 0
-          return `[${w.id}] ${w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length}` : ''} — ${w.title} — ${w.last}`
+          return `[${w.id}] ${w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length} ${clip(one(w.warn[0]!), 90)}` : ''} — ${w.title} — ${w.last}`
         })
-        .concat(`session total ${money(led.cost)} · ${led.spawned} spawned`)
+        .concat(`session total ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''} · ${led.spawned} spawned`)
         .join('\n'),
     )
   })
@@ -2168,6 +2500,32 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state !== 'running' && w.state !== 'queued') w.isReported = true
     return text(await digest(w, e.detail === 'full'))
+  })
+
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_log' }, async (_$, e) => {
+    const w = pick(e)
+    if (!w) return text(`no worker ${String(e.id)}`, true)
+    const events = w.events ?? []
+    const total = w.eventTotal ?? events.length
+    const windowStart = Math.max(0, total - events.length)
+    const requested = Number(e.count ?? 40)
+    const count = Math.min(Math.max(Number.isFinite(requested) ? Math.floor(requested) : 40, 1), 200)
+    const askedFrom = e.from == null ? Math.max(windowStart, total - count) : Math.max(0, Math.floor(Number(e.from) || 0))
+    const from = Math.max(windowStart, askedFrom)
+    const kinds = Array.isArray(e.kinds) ? new Set((e.kinds as unknown[]).map(String)) : undefined
+    const page = events
+      .map((line, i) => ({ index: windowStart + i, line }))
+      .filter(({ index, line }) => {
+        if (index < from) return false
+        const kind = line.startsWith('ERR ') || line.startsWith('raw:') ? 'error' : line.startsWith('text ') ? 'assistant' : line.startsWith('TOOL ') ? 'tool' : 'other'
+        return !kinds || kinds.has(kind)
+      })
+      .slice(0, count)
+    const retained = total > windowStart ? `${windowStart}..${total - 1}` : 'empty'
+    const lines = [`[${w.id}] log: ${total} total events; retained window ${retained}; page from ${from}${askedFrom < windowStart ? ` (requested ${askedFrom} is outside retained window)` : ''}, ${count} max`]
+    lines.push(...page.map(({ index, line }) => `${index}: ${line}`))
+    if (!page.length) lines.push('(no matching events)')
+    return text(lines.join('\n'))
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_btw' }, async ($, e) => {
@@ -2209,7 +2567,7 @@ export const register: Register = on => {
       const dFiles = w.files.size - (w.waitFiles ?? 0)
       const quiet = w.lastAt ? Math.round((Date.now() - w.lastAt) / 1000) : 0
       parts.push(
-        `[${w.id}] running ${elapsed(w)} · steps ${w.steps}${dSteps ? ` (+${dSteps})` : ' (no new steps)'} · files ${w.files.size}${dFiles ? ` (+${dFiles})` : ''} · now: ${w.last}${quiet > 20 ? ` · quiet ${quiet}s` : ''}`,
+        `[${w.id}] running ${elapsed(w)} · steps ${w.steps}${dSteps ? ` (+${dSteps})` : ' (no new steps)'} · files ${w.files.size}${dFiles ? ` (+${dFiles})` : ''} · now: ${w.last}${quiet > 20 ? ` · quiet ${quiet}s` : ''}${w.warn.length ? ` · ⚠ ${w.warn.join('; ')}` : ''}`,
       )
       w.waitSteps = w.steps
       w.waitFiles = w.files.size
@@ -2222,11 +2580,12 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_send' }, async ($, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state === 'running') return text(`${w.id} is still running`, true)
+    const interrupt = e.interrupt === true
+    if (w.state === 'running' && !interrupt) return text(`${w.id} is still running; pass interrupt:true to abort it and redirect in the same process`, true)
     if (!w.send && !w.session) return text(`${w.id} has no live process or session id to continue`, true)
     const notReady = await ensureSetup()
     if (notReady) return text(notReady, true)
-    if (running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers; pi_send follow-ups are not queued (they resume an existing session), so wait for a slot and try again`, true)
+    if (w.state !== 'running' && running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers; pi_send follow-ups are not queued (they resume an existing session), so wait for a slot and try again`, true)
     const message = String(e.message ?? '').trim()
     if (!message) return text('message is required', true)
     if (typeof e.maxMinutes === 'number' && e.maxMinutes > 0) w.maxMinutes = Math.min(e.maxMinutes, 240)
@@ -2245,6 +2604,38 @@ export const register: Register = on => {
       if ((w.skills?.length ?? 0) + added.length > MAX_SKILLS) return text(`${w.id} would have ${(w.skills?.length ?? 0) + added.length} skills; max ${MAX_SKILLS}`, true)
       if (added.length) w.skills = [...(w.skills ?? []), ...added]
     }
+    if (w.state === 'running') {
+      if (!interrupt) return text(`${w.id} is still running`, true)
+      if (!w.send) return text(`${w.id} has no live process to interrupt`, true)
+      w.interrupting = true
+      w.interruptedRun = clip(one(w.texts.at(-1)?.trim() || w.last || 'no final message'), 180)
+      try {
+        await w.send({ type: 'abort' })
+      } catch (err) {
+        w.interrupting = false
+        return text(`could not abort ${w.id}: ${String(err)}`, true)
+      }
+      const settled = w.state !== 'running' || await new Promise<boolean>(resolve => {
+        const waiters = (w.settleWaiters ??= [])
+        let timer: { cancel: () => void } | undefined
+        const remove = () => {
+          const at = waiters.indexOf(onSettled)
+          if (at >= 0) waiters.splice(at, 1)
+          timer?.cancel()
+        }
+        const onSettled = () => {
+          remove()
+          resolve(true)
+        }
+        waiters.push(onSettled)
+        timer = $.clock.after(15_000, () => {
+          remove()
+          resolve(w.state !== 'running')
+        })
+      })
+      if (!settled) return text(`${w.id} did not settle within 15 seconds after abort; no prompt was sent`, true)
+      if (!w.send) return text(`${w.id} settled but its Pi process stopped; no prompt was sent to a different process`, true)
+    }
     w.texts = []
     w.errors = []
     B?.launch(w, added.length && w.send ? `Your supervisor attached ${added.length === 1 ? 'a skill' : 'skills'} for this follow-up. Read each SKILL.md before you work in its area and follow its patterns:\n${skillsText(added)}\n\n${message}` : message)
@@ -2257,8 +2648,15 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     const cap = Math.min(Math.max(Number(e.maxChars ?? 8000), 500), 40000)
     // No isolated worktree (a non-git dir, or worktree:false): diff against the originals the guard saved.
-    if (!w.worktree) return text((await B?.nonGitDiff(w, cap)) ?? 'not ready', false)
+    if (!w.worktree) {
+      const diff = (await B?.nonGitDiff(w, cap)) ?? 'not ready'
+      if (w.owns === undefined) return text(diff, false)
+      const changed = (await B?.changed(w)) ?? []
+      const outside = changed.filter(file => !matchesAny(w.owns!, file))
+      return text(`${outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}\n\n` : ''}${diff}`, false)
+    }
     const cwdW = workDir(w)
+    const ownershipDiff = await $.process.run(['git', 'diff', '--name-only', 'HEAD'], { cwd: w.worktree, timeoutMs: 20_000 })
     const stat = await $.process.run(['git', 'diff', '--stat', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
     const diff = await $.process.run(['git', 'diff', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
     const untracked = await $.process.run(['git', 'ls-files', '--others', '--exclude-standard'], {
@@ -2267,6 +2665,9 @@ export const register: Register = on => {
     })
     // New files have no tracked diff: show their content as additions (first few, so a review sees what was created).
     const fresh = untracked.stdout.split('\n').filter(f => f && !/__pycache__|\.pyc$/.test(f))
+    const ownershipNames = [...ownershipDiff.stdout.split('\n').filter(Boolean), ...fresh.map(f => `${w.sub?.replace(/^\//, '')}${w.sub ? '/' : ''}${f}`)]
+    const outside = w.owns === undefined ? [] : [...new Set(ownershipNames)].filter(file => !matchesAny(w.owns!, file))
+    const ownershipWarning = outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}` : ''
     const created: string[] = []
     for (const f of fresh.slice(0, 8)) {
       const d = await $.process.run(['git', 'diff', '--no-index', '--', '/dev/null', f], { cwd: cwdW, timeoutMs: 20_000 }).catch(() => undefined)
@@ -2274,6 +2675,7 @@ export const register: Register = on => {
     }
     const out = [
       stat.stdout.trim() || '(no tracked changes)',
+      ownershipWarning,
       fresh.length ? `untracked (${fresh.length}):\n${fresh.join('\n')}` : '',
       clip(diff.stdout, cap),
       ...created,
