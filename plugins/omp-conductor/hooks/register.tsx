@@ -2679,7 +2679,7 @@ export const register: Register = on => {
               }
             }
             if (Date.now() >= deadline) return reply(`${context()}\nbtw timed out after ${Math.round(waitMs / 1000)}s.`, true)
-            await new Promise<void>(resolve => $.clock.after(Math.min(500, deadline - Date.now()), resolve))
+            await $.process.run(['sleep', '0.5'], { timeoutMs: 5000 }).catch(() => undefined) // a $ call in flight, not $.clock: the hook's 10 s budget would end the wait
           }
         } catch (err) {
           return reply(`${context()}\nbtw failed: ${String(err)}`, true)
@@ -3805,15 +3805,12 @@ export const register: Register = on => {
     const done = () => list.filter(w => w.state !== 'running' && w.state !== 'queued' && !w.reviewPending)
     const shouldReturn = () => mode === 'first' ? changed().length > 0 : mode === 'any' ? done().length > 0 : done().length === list.length
     if (!shouldReturn()) {
-      // The timeout and the dispatch abort both end the wait through $.clock.sleep; the module sandbox has no AbortSignal.addEventListener.
-      let listener: (() => void) | undefined
-      await new Promise<void>(resolve => {
-        listener = () => { if (shouldReturn()) resolve() }
-        waitListeners.add(listener)
-        void $.clock.sleep(limitMs, { signal: next.signal }).then(() => resolve(), () => resolve())
-        listener()
-      })
-      if (listener) waitListeners.delete(listener)
+      // A hook has a 10 s budget of its own time that $.clock waits spend; a $ call in flight does not. So wait in 1 s
+      // `sleep` processes and re-check after each one: a long wait costs no budget and still returns within a second of an event.
+      const startedAt = Date.now()
+      while (!shouldReturn() && Date.now() - startedAt < limitMs && !next.signal.aborted) {
+        await $.process.run(['sleep', '1'], { timeoutMs: 5000 }).catch(() => undefined)
+      }
     }
     const changedWorkers = changed()
     const selected = mode === 'first' && changedWorkers.length ? changedWorkers : list
@@ -3939,24 +3936,10 @@ export const register: Register = on => {
         w.interrupting = false
         return text(`could not abort ${w.id}: ${String(err)}`, true)
       }
-      const settled = w.state !== 'running' || await new Promise<boolean>(resolve => {
-        const waiters = (w.settleWaiters ??= [])
-        let timer: { cancel: () => void } | undefined
-        const remove = () => {
-          const at = waiters.indexOf(onSettled)
-          if (at >= 0) waiters.splice(at, 1)
-          timer?.cancel()
-        }
-        const onSettled = () => {
-          remove()
-          resolve(true)
-        }
-        waiters.push(onSettled)
-        timer = $.clock.after(15_000, () => {
-          remove()
-          resolve(w.state !== 'running')
-        })
-      })
+      // Waited in 1 s `sleep` processes: a $ call in flight does not spend the hook's 10 s budget, a $.clock wait does.
+      const settleBy = Date.now() + 15_000
+      while (w.state === 'running' && Date.now() < settleBy) await $.process.run(['sleep', '0.5'], { timeoutMs: 5000 }).catch(() => undefined)
+      const settled = w.state !== 'running'
       if (!settled) return text(`${w.id} did not settle within 15 seconds after abort; no prompt was sent`, true)
       if (!w.send) return text(`${w.id} settled but its Pi process stopped; no prompt was sent to a different process`, true)
     }
