@@ -5,7 +5,7 @@ import { existsSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 const DEFAULT_QUESTION = "What exactly are you doing right now, why is it taking this long, what is left, and are you stuck?";
-const SYSTEM_PROMPT = "Answer the supervisor's side question about your own progress: what you are doing now, why it may be slow, what is left, whether you are stuck or looping. Be concrete, 5 sentences max.";
+const SYSTEM_PROMPT = "You are a coding worker answering your supervisor's side question about your own progress. You have your normal tools (read, edit, write, bash, grep and so on); this side call simply has no tools of its own, so never say you lack tools or access. Answer only from the transcript and the 'Currently running' line you are given: what you have done, what you are doing right now (the running tool call and how long it has run), why it may be slow, what is left, and whether you are stuck or looping. Be concrete, plain prose, 5 sentences max, no SUMMARY or FINDINGS block.";
 const MAX_BRANCH_CHARS = 14_000;
 const MAX_RECENT_CHARS = 10_500;
 const MAX_RESULT_CHARS = 1_000;
@@ -104,6 +104,18 @@ async function getAnswer(ctx: any, question: string, branch: string): Promise<st
 }
 
 export default function (pi: ExtensionAPI) {
+	// The session branch only records finished tool calls; track the one that is running so the answer can name it.
+	let inflight: { name: string; input: unknown; at: number } | undefined;
+	pi.on("tool_call", async (event: any) => {
+		inflight = { name: String(event.toolName ?? "tool"), input: event.input, at: Date.now() };
+	});
+	pi.on("tool_result", async () => { inflight = undefined; });
+	const runningLine = () => {
+		if (!inflight) return "Currently running: no tool call (thinking or between steps).";
+		let args = "";
+		try { args = JSON.stringify(inflight.input ?? {}).slice(0, 300); } catch { args = "[unavailable]"; }
+		return `Currently running: ${inflight.name} ${args} for ${Math.round((Date.now() - inflight.at) / 1000)}s.`;
+	};
 	pi.registerCommand("btw", {
 		description: "Answer a supervisor's side question without adding it to this session",
 		handler: async (args: string, ctx: any) => {
@@ -132,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const started = Date.now();
-				const branch = renderBranch(ctx);
+				const branch = `${renderBranch(ctx)}\n\n${runningLine()}`;
 				const answer = await getAnswer(ctx, question, branch);
 				if (!answer) throw new Error("Nested model returned an empty answer");
 				writeResult(dir, { id: reqId, q: question, a: answer, at: new Date().toISOString(), ms: Date.now() - started });
