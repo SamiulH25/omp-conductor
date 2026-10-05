@@ -1,6 +1,6 @@
 ---
 name: orchestrate-pi
-description: Use when a task splits into independent pieces that Pi workers can do in parallel (pi_spawn, pi_tools, pi_wait, pi_digest, pi_diff, pi_merge, pi_cleanup). Covers briefing workers, the checks workers run themselves, reviewing real diffs instead of summaries, and merging.
+description: Use when a task splits into independent pieces that Pi workers can do in parallel (pi_spawn, pi_tools, pi_wait, pi_btw, pi_digest, pi_diff, pi_merge, pi_cleanup). Covers briefing workers, the checks workers run themselves, reviewing real diffs instead of summaries, and merging.
 ---
 
 # Orchestrating Pi workers
@@ -63,6 +63,10 @@ Pick `agent` on `pi_spawn` by what the worker may do:
    - Wrong approach: `pi_cleanup` with `force: true` and re-spawn with a better brief.
    - Stuck or runaway: `pi_kill`.
 6. **Finish** by running the project's own tests in the merged repo yourself.
+
+## When a worker is quiet or slow
+
+When `pi_wait` shows a worker running past its expected time or quiet, call `pi_btw` before killing or steering it. If it is stuck or looping, `pi_send` a steer or `pi_kill`; if it is making progress, keep waiting.
 
 ## Skills (push what you know onto workers)
 
