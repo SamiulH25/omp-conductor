@@ -13,10 +13,24 @@
 //    a required check was not run after the last change, asks for exactly those `check <name>` runs before the report.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { matchesAny } from "./owns";
 
 const MARK = "[guard]";
 const SEARCH = new Set(["grep", "find", "ls"]);
+const OWNED = process.env.PI_OWNS === undefined ? undefined : (() => {
+	try {
+		const parsed = JSON.parse(process.env.PI_OWNS ?? "[]");
+		return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+	} catch {
+		return [];
+	}
+})();
+
+const inside = (path: string, parent: string) => {
+	const rel = relative(resolve(parent), path);
+	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
 
 export default function (pi: ExtensionAPI) {
 	const reads = new Map<string, string>(); // path|range -> file signature when last read
@@ -114,6 +128,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			searches.set(key, mutations);
 		} else if (name === "edit" || name === "write") {
+			if (OWNED !== undefined && typeof input.path === "string") {
+				const abs = resolve(ctx.cwd ?? process.cwd(), input.path);
+				const root = resolve(WORK || ctx.cwd || process.cwd());
+				const rel = relative(root, abs).split(sep).join("/");
+				const exempt = [process.env.TMPDIR, process.env.PI_SNAPSHOT_DIR].some(dir => !!dir && inside(abs, dir));
+				if (!exempt && (!inside(abs, root) || !matchesAny(OWNED, rel))) {
+					return { block: true, reason: `${MARK} path ${input.path} is outside this worker's owned files: ${OWNED.join(", ") || "(none)"}` };
+				}
+			}
 			if (typeof input.path === "string") snapshot(resolve(ctx.cwd ?? process.cwd(), input.path));
 			if (name === "edit" && typeof input.path === "string" && Array.isArray(input.edits) && input.edits.length > 1) {
 				try {
