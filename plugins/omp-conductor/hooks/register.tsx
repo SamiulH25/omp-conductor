@@ -1882,7 +1882,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_send',
       description:
-        'Send a follow-up message to a finished worker, or pass interrupt:true to abort a running worker and send the new prompt in the same process after it settles (up to 15 seconds). Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read. Follow-ups to finished workers are refused rather than queued when all worker slots are occupied.'
+        'Send a follow-up message to a finished worker, or pass interrupt:true to abort a running worker and send the new prompt in the same process after it settles (up to 15 seconds). Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read. Follow-ups to finished workers are refused rather than queued when all worker slots are occupied.',
       inputSchema: obj(
         {
           ...idProp,
