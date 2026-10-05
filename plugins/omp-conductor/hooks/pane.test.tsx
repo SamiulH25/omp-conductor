@@ -10,7 +10,7 @@ test('pane draws the empty state and the demo workers on every surface that has 
         component: 'Pane',
         requestId: 'omp-conductor',
         props: { title: 'x', isFocused: false } as never,
-        viewport: { columns: 80, rows: 40 } as never,
+        viewport: { columns: 80, rows: 80 } as never,
       })
 
     const empty = await mount()

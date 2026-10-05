@@ -894,8 +894,7 @@ export const register: Register = on => {
   const notifyWaiters = () => { for (const listener of waitListeners) listener() }
   const pushWarning = (w: Worker, warning: string) => { w.warn.push(warning); notifyWaiters() }
   let B: Bridge | undefined
-  let sessionApi: any
-  let spawnWorker: (($: any, e: Record<string, any>, options?: { model?: string; raceBatch?: string; caller?: Worker; onCreated?: (w: Worker) => void }) => Promise<any>) | undefined
+  let spawnWorker: ((e: Record<string, any>, options?: { model?: string; raceBatch?: string; caller?: Worker; onCreated?: (w: Worker) => void }) => Promise<any>) | undefined
   let mergeChain: Promise<unknown> = Promise.resolve()
   let cwd = ''
   let home = ''
@@ -920,7 +919,8 @@ export const register: Register = on => {
   let raceSeq = 0
   let btwSeq = 0
   let agentWarnings: string[] = []
-  let loadAgentCatalog = async (_$: any) => ({ agents: AGENTS, warnings: agentWarnings })
+  let loadAgentCatalog = async () => ({ agents: AGENTS, warnings: agentWarnings })
+  let runReview: any, askBtw: any, managerResponse: any, managerWait: any, managerDiff: any, managerSend: any, managerMerge: any, managerOperation: any, scanManagerRequests: any
   const notesFile = (root: string) => `${agentDir}/notes/${encodeURIComponent(root)}.txt`
   const mapBatches = new Map<string, { ids: string[]; maxParallel: number }>()
   const managerInflight = new Map<string, Set<string>>()
@@ -1045,81 +1045,6 @@ export const register: Register = on => {
     }
   }
 
-  const runReview = async ($: any, w: Worker) => {
-    let reviewer: Worker | undefined
-    let fixPrompt: string | undefined
-    w.reviewRoundsUsed = (w.reviewRoundsUsed ?? 0) + 1
-    try {
-      if (!spawnWorker || !B) throw new Error('worker spawner is unavailable')
-      let diff = ''
-      if (w.worktree && w.branch) {
-        const target = await B.git(['rev-parse', 'HEAD'], w.dir)
-        const committed = target?.exitCode === 0 ? await B.git(['diff', '--no-ext-diff', `${target.stdout.trim()}...${w.branch}`], w.dir) : undefined
-        const uncommitted = await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w))
-        diff = [committed?.stdout, uncommitted?.stdout].filter(Boolean).join('\n')
-      } else if (w.isGit) {
-        diff = (await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w)))?.stdout ?? ''
-      } else {
-        diff = await B.nonGitDiff(w, 40_000)
-      }
-      if (!diff.trim()) throw new Error('could not collect a diff to review')
-      const config = w.reviewBy ?? {}
-      const prompt = `Review this worker's completed change. Original task:\n${w.task}\n\nDiff of the worker's worktree:\n${clip(diff, 60_000)}\n\nReport only actionable issues introduced by this diff, severity-ranked, with exact file:line references and a concrete failure scenario. Write each finding as one bullet formatted exactly "- [high] path/to/file:line — issue and failure scenario" (use medium or low where appropriate). Mark severity high only for blocking correctness/security/data-loss issues; list medium/low separately. If there are no blocking issues, explicitly say so. Do not edit files. End with your complete findings.`
-      let spawnResult: any
-      spawnResult = await spawnWorker($, {
-        task: prompt,
-        title: `review ${w.id}`,
-        dir: w.dir,
-        agent: 'review',
-        noDict: true,
-        worktree: false,
-        checks: [],
-        codex: config.codex === true,
-        ...(config.effort ? { effort: config.effort } : {}),
-      }, { onCreated: created => { reviewer = created } })
-      if (!reviewer) throw new Error(spawnResult?.deny ?? spawnResult?.result ?? 'reviewer could not be spawned')
-      await sync()
-      while (reviewer.state === 'running' || reviewer.state === 'queued') {
-        await $.process.run(['sleep', '1'], { timeoutMs: 3000 }).catch(() => undefined)
-      }
-      const report = reviewer.texts.at(-1)?.trim() || reviewer.runError || `reviewer ended ${reviewer.state} without a report`
-      w.reviewReport = [w.reviewReport, `Review round ${w.reviewRoundsUsed} (${reviewer.id}, ${reviewer.state}):\n${clip(report, 20_000)}`].filter(Boolean).join('\n\n')
-      if (reviewer.state !== 'done') throw new Error(`reviewer ${reviewer.id} ${reviewer.state}: ${reviewer.runError ?? reviewer.last}`)
-      const blocking = parseReviewFindings(report).filter(finding => finding.blocking)
-      if (blocking.length && (w.reviewRoundsLeft ?? 0) > 0) {
-        w.reviewRoundsLeft = (w.reviewRoundsLeft ?? 0) - 1
-        fixPrompt = `The code review found blocking issues. Fix these in your worktree, then stop and report. Do not ignore or weaken the findings.\n\n${blocking.map(finding => `[${finding.severity}] ${finding.location}: ${finding.text}`).join('\n\n')}`
-      } else if (blocking.length) {
-        pushWarning(w, `review found ${blocking.length} blocking issue(s) after ${w.reviewRoundsUsed} review round(s); no fix rounds remain`)
-      }
-    } catch (err) {
-      const warning = `review failed; worker completed without review: ${clip(one(String((err as Error)?.message ?? err)), 300)}`
-      pushWarning(w, warning)
-      w.reviewReport = [w.reviewReport, warning].filter(Boolean).join('\n\n')
-    } finally {
-      if (reviewer) {
-        reviewer.stop?.()
-        await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${reviewer.id}`, `${agentDir}/snap/${sid}-${reviewer.id}`, `${agentDir}/run/${sid}-${reviewer.id}.marker`, `${agentDir}/run/${sid}-${reviewer.id}.btw`, `${agentDir}/run/${sid}-${reviewer.id}.jsonl`], { timeoutMs: 15_000 }).catch(() => undefined)
-        workers.delete(reviewer.id)
-      }
-    }
-    if (fixPrompt) {
-      w.reviewPending = false
-      w.reviewDone = false
-      B?.launch(w, fixPrompt)
-      return
-    }
-    w.reviewPending = false
-    w.reviewDone = true
-    w.endedAt = Date.now()
-    snapshotDependency(w)
-    scheduleQueue()
-    notifyWaiters()
-    for (const settled of w.settleWaiters ?? []) settled()
-    w.settleWaiters = []
-    await B?.finished(w)
-    await sync()
-  }
 
   // A run is over (Pi settled, the process died, it was killed or hit its time limit). The process may stay up.
   const finish = (w: Worker) => {
@@ -1512,74 +1437,6 @@ export const register: Register = on => {
   }
   const orchestratorScopeError = (w: Worker) => w.parent ? `${w.id} belongs to manager ${w.parent}; talk to ${w.parent}` : undefined
 
-  const askBtw = async ($: any, id: string, question: unknown, timeoutSec: unknown, force: unknown, caller?: Worker) => {
-    const reply = (message: string, error = false) => ({ message, error })
-    const w = workers.get(id)
-    if (!w) return reply(`no worker ${id}`, true)
-    const scopeError = caller ? managerChildScope(caller, w) : orchestratorScopeError(w)
-    if (scopeError) return reply(scopeError, true)
-    if (w.state !== 'running') return reply(`${id} is ${w.state}; pi_btw only works on a running worker. Use pi_digest for its result or pi_send to continue it.`, true)
-    if (!w.send) return reply(`${id} has no live Pi process; use pi_digest to read its result or pi_send to resume it.`, true)
-    if (w.btwPending) return reply(`${id} already has a btw request in progress; wait for it to finish.`, true)
-
-    const now = Date.now()
-    if (force !== true) {
-      if ((w.btwCount ?? 0) >= 5) return reply(`${id} has reached the limit of 5 btw calls; pass force:true to override.`, true)
-      if (w.btwAt && now - w.btwAt < 30_000) {
-        const left = Math.ceil((30_000 - (now - w.btwAt)) / 1000)
-        return reply(`${id} was asked recently; wait ${left}s before the next btw call or pass force:true.`, true)
-      }
-    }
-
-    const q = (typeof question === 'string' ? question : '').trim().replace(/\s+/g, ' ') || DEFAULT_BTW_QUESTION
-    const reqId = `${now.toString(36)}${(++btwSeq).toString(36)}`
-    const btwDir = (w.btwDir ??= `${agentDir}/run/${w.pathKey ?? `${w.sessionId ?? sid}-${w.id}`}.btw`)
-    const file = `${btwDir}/${reqId}.json`
-    const asked = Number(timeoutSec ?? 60)
-    const waitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 60, 1), 90) * 1000
-    const deadline = Date.now() + waitMs
-    w.btwAt = now
-    w.btwCount = (w.btwCount ?? 0) + 1
-    w.btwPending = reqId
-    w.btwResponse = undefined
-    void B?.sync()
-
-    const context = () => {
-      const quiet = w.lastAt ? ` · last event ${Math.round((Date.now() - w.lastAt) / 1000)}s ago` : ''
-      return `[${w.id}] ${w.state} · elapsed ${elapsed(w)} · last activity: ${w.last || 'none'}${quiet}`
-    }
-    try {
-      await $.fs.write(`${btwDir}/.keep`, '').catch(() => undefined)
-      await w.send({ type: 'prompt', message: `/btw ${reqId} ${q}` })
-      for (;;) {
-        const response = w.btwResponse as Worker['btwResponse'] // set by the event handler while we poll
-        if (response?.id === reqId && response.disposition !== 'handled') {
-          return reply('btw unavailable on this worker (extension not loaded)', true)
-        }
-        const raw = await $.fs.read(file).catch(() => undefined)
-        if (typeof raw === 'string' && raw.trim()) {
-          let data: any
-          try {
-            data = JSON.parse(raw)
-          } catch {
-            return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
-          }
-          if (data?.id === reqId) {
-            if (typeof data.error === 'string') return reply(`${context()}\n${data.error}`, true)
-            if (typeof data.a === 'string') return reply(`${context()}\n${data.a}`)
-            return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
-          }
-        }
-        if (Date.now() >= deadline) return reply(`${context()}\nbtw timed out after ${Math.round(waitMs / 1000)}s.`, true)
-        await new Promise<void>(resolve => $.clock.after(Math.min(500, deadline - Date.now()), resolve))
-      }
-    } catch (err) {
-      return reply(`${context()}\nbtw failed: ${String(err)}`, true)
-    } finally {
-      if (w.btwPending === reqId) w.btwPending = undefined
-      if ((w.btwResponse as Worker['btwResponse'])?.id === reqId) w.btwResponse = undefined
-    }
-  }
 
   const toolsText = (t: Toolbox) =>
     Object.entries(t.checks)
@@ -1588,7 +1445,6 @@ export const register: Register = on => {
 
   // ---------------------------------------------------------------- hooks
   on('session.start', async ($, e, next) => {
-    sessionApi = $
     cwd = (e as { cwd?: string }).cwd ?? ''
     home = (await $.process.run(['printenv', 'HOME']).catch(() => undefined))?.stdout.trim() ?? ''
     agentDir = `${home}/${AGENT_DIR_NAME}`
@@ -1672,7 +1528,7 @@ export const register: Register = on => {
     let verifyChain: Promise<unknown> = Promise.resolve() // verify commands run one at a time (a locked editor cannot run two)
     const storeKey = `${STORE_PREFIX}${await $.session.id()}`
     {
-    loadAgentCatalog = async ($: any) => {
+    loadAgentCatalog = async () => { // closes over the hook's $; redeclaring $ is refused by the engine
       const warnings: string[] = []
       const custom: Record<string, AgentType> = {}
       const raw = await $.fs.read(`${agentDir}/agents.json`).catch(() => undefined)
@@ -1844,7 +1700,7 @@ export const register: Register = on => {
     for (const r of [...registryWorkers, ...(Array.isArray(saved?.workers) ? saved.workers : [])]) {
       if (r && typeof r.id === 'string') allSaved.set(r.id, r)
     }
-    const availableAgents = (await loadAgentCatalog($)).agents
+    const availableAgents = (await loadAgentCatalog()).agents
     for (const [id, r] of allSaved) {
       const oldFinished = ['done', 'failed', 'killed'].includes(r.state) &&
         !String(r.last ?? '').startsWith('restored;') && !String(r.last ?? '').startsWith('interrupted;')
@@ -2189,7 +2045,7 @@ export const register: Register = on => {
         return clip([head, ...parts].join('\n\n'), cap)
       },
 
-      review: w => runReview($, w),
+      review: w => runReview(w),
 
       verify: async w => {
         const run = verifyChain.then(async () => {
@@ -2396,7 +2252,7 @@ export const register: Register = on => {
       required,
     })
     const idProp = { id: { type: 'string', description: 'Worker id from pi_spawn' } }
-    const availableAgentTypes = (await loadAgentCatalog($)).agents
+    const availableAgentTypes = (await loadAgentCatalog()).agents
 
     await $.tool.register({
       name: 'pi_spawn',
@@ -2661,8 +2517,8 @@ export const register: Register = on => {
             warned = true
             const askedAt = Date.now()
             if (!w.btwPending && (w.btwCount ?? 0) < 5 && (!w.btwAt || askedAt - w.btwAt >= 30_000)) {
-              void askBtw($, w.id, `You may be stuck or looping (${finding.message}). What are you doing and what is blocking you?`, 45, false, w.parent ? workers.get(w.parent) : undefined)
-                .then(result => {
+              void askBtw(w.id, `You may be stuck or looping (${finding.message}). What are you doing and what is blocking you?`, 45, false, w.parent ? workers.get(w.parent) : undefined)
+                .then((result: { error?: boolean; message: string }) => {
                   if (result.error) return
                   const newline = result.message.indexOf('\n')
                   const answer = newline < 0 ? result.message : result.message.slice(newline + 1)
@@ -2679,13 +2535,696 @@ export const register: Register = on => {
       }
     })
     $.clock.every(500, () => {
-      if ([...workers.values()].some(worker => worker.agent === 'manager' && worker.state === 'running')) void scanManagerRequests($).catch(() => undefined)
+      if ([...workers.values()].some(worker => worker.agent === 'manager' && worker.state === 'running')) void scanManagerRequests().catch(() => undefined)
     })
     // The pane's animation clock: one tick per frame, only while a worker runs.
     $.clock.every(200, () => {
       if (running() > 0 || demoOn) void update($, frameAtom, n => (n ?? 0) + 1)
     })
 
+    // helpers that use $ live inside the hook so they close over it (the engine refuses to let $ be passed around)
+      runReview = async (w: Worker) => {
+        let reviewer: Worker | undefined
+        let fixPrompt: string | undefined
+        w.reviewRoundsUsed = (w.reviewRoundsUsed ?? 0) + 1
+        try {
+          if (!spawnWorker || !B) throw new Error('worker spawner is unavailable')
+          let diff = ''
+          if (w.worktree && w.branch) {
+            const target = await B.git(['rev-parse', 'HEAD'], w.dir)
+            const committed = target?.exitCode === 0 ? await B.git(['diff', '--no-ext-diff', `${target.stdout.trim()}...${w.branch}`], w.dir) : undefined
+            const uncommitted = await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w))
+            diff = [committed?.stdout, uncommitted?.stdout].filter(Boolean).join('\n')
+          } else if (w.isGit) {
+            diff = (await B.git(['diff', '--no-ext-diff', 'HEAD'], workDir(w)))?.stdout ?? ''
+          } else {
+            diff = await B.nonGitDiff(w, 40_000)
+          }
+          if (!diff.trim()) throw new Error('could not collect a diff to review')
+          const config = w.reviewBy ?? {}
+          const prompt = `Review this worker's completed change. Original task:\n${w.task}\n\nDiff of the worker's worktree:\n${clip(diff, 60_000)}\n\nReport only actionable issues introduced by this diff, severity-ranked, with exact file:line references and a concrete failure scenario. Write each finding as one bullet formatted exactly "- [high] path/to/file:line — issue and failure scenario" (use medium or low where appropriate). Mark severity high only for blocking correctness/security/data-loss issues; list medium/low separately. If there are no blocking issues, explicitly say so. Do not edit files. End with your complete findings.`
+          let spawnResult: any
+          spawnResult = await spawnWorker({
+            task: prompt,
+            title: `review ${w.id}`,
+            dir: w.dir,
+            agent: 'review',
+            noDict: true,
+            worktree: false,
+            checks: [],
+            codex: config.codex === true,
+            ...(config.effort ? { effort: config.effort } : {}),
+          }, { onCreated: created => { reviewer = created } })
+          if (!reviewer) throw new Error(spawnResult?.deny ?? spawnResult?.result ?? 'reviewer could not be spawned')
+          await sync()
+          while (reviewer.state === 'running' || reviewer.state === 'queued') {
+            await $.process.run(['sleep', '1'], { timeoutMs: 3000 }).catch(() => undefined)
+          }
+          const report = reviewer.texts.at(-1)?.trim() || reviewer.runError || `reviewer ended ${reviewer.state} without a report`
+          w.reviewReport = [w.reviewReport, `Review round ${w.reviewRoundsUsed} (${reviewer.id}, ${reviewer.state}):\n${clip(report, 20_000)}`].filter(Boolean).join('\n\n')
+          if (reviewer.state !== 'done') throw new Error(`reviewer ${reviewer.id} ${reviewer.state}: ${reviewer.runError ?? reviewer.last}`)
+          const blocking = parseReviewFindings(report).filter(finding => finding.blocking)
+          if (blocking.length && (w.reviewRoundsLeft ?? 0) > 0) {
+            w.reviewRoundsLeft = (w.reviewRoundsLeft ?? 0) - 1
+            fixPrompt = `The code review found blocking issues. Fix these in your worktree, then stop and report. Do not ignore or weaken the findings.\n\n${blocking.map(finding => `[${finding.severity}] ${finding.location}: ${finding.text}`).join('\n\n')}`
+          } else if (blocking.length) {
+            pushWarning(w, `review found ${blocking.length} blocking issue(s) after ${w.reviewRoundsUsed} review round(s); no fix rounds remain`)
+          }
+        } catch (err) {
+          const warning = `review failed; worker completed without review: ${clip(one(String((err as Error)?.message ?? err)), 300)}`
+          pushWarning(w, warning)
+          w.reviewReport = [w.reviewReport, warning].filter(Boolean).join('\n\n')
+        } finally {
+          if (reviewer) {
+            reviewer.stop?.()
+            await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${reviewer.id}`, `${agentDir}/snap/${sid}-${reviewer.id}`, `${agentDir}/run/${sid}-${reviewer.id}.marker`, `${agentDir}/run/${sid}-${reviewer.id}.btw`, `${agentDir}/run/${sid}-${reviewer.id}.jsonl`], { timeoutMs: 15_000 }).catch(() => undefined)
+            workers.delete(reviewer.id)
+          }
+        }
+        if (fixPrompt) {
+          w.reviewPending = false
+          w.reviewDone = false
+          B?.launch(w, fixPrompt)
+          return
+        }
+        w.reviewPending = false
+        w.reviewDone = true
+        w.endedAt = Date.now()
+        snapshotDependency(w)
+        scheduleQueue()
+        notifyWaiters()
+        for (const settled of w.settleWaiters ?? []) settled()
+        w.settleWaiters = []
+        await B?.finished(w)
+        await sync()
+      }
+      askBtw = async (id: string, question: unknown, timeoutSec: unknown, force: unknown, caller?: Worker) => {
+        const reply = (message: string, error = false) => ({ message, error })
+        const w = workers.get(id)
+        if (!w) return reply(`no worker ${id}`, true)
+        const scopeError = caller ? managerChildScope(caller, w) : orchestratorScopeError(w)
+        if (scopeError) return reply(scopeError, true)
+        if (w.state !== 'running') return reply(`${id} is ${w.state}; pi_btw only works on a running worker. Use pi_digest for its result or pi_send to continue it.`, true)
+        if (!w.send) return reply(`${id} has no live Pi process; use pi_digest to read its result or pi_send to resume it.`, true)
+        if (w.btwPending) return reply(`${id} already has a btw request in progress; wait for it to finish.`, true)
+
+        const now = Date.now()
+        if (force !== true) {
+          if ((w.btwCount ?? 0) >= 5) return reply(`${id} has reached the limit of 5 btw calls; pass force:true to override.`, true)
+          if (w.btwAt && now - w.btwAt < 30_000) {
+            const left = Math.ceil((30_000 - (now - w.btwAt)) / 1000)
+            return reply(`${id} was asked recently; wait ${left}s before the next btw call or pass force:true.`, true)
+          }
+        }
+
+        const q = (typeof question === 'string' ? question : '').trim().replace(/\s+/g, ' ') || DEFAULT_BTW_QUESTION
+        const reqId = `${now.toString(36)}${(++btwSeq).toString(36)}`
+        const btwDir = (w.btwDir ??= `${agentDir}/run/${w.pathKey ?? `${w.sessionId ?? sid}-${w.id}`}.btw`)
+        const file = `${btwDir}/${reqId}.json`
+        const asked = Number(timeoutSec ?? 60)
+        const waitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 60, 1), 90) * 1000
+        const deadline = Date.now() + waitMs
+        w.btwAt = now
+        w.btwCount = (w.btwCount ?? 0) + 1
+        w.btwPending = reqId
+        w.btwResponse = undefined
+        void B?.sync()
+
+        const context = () => {
+          const quiet = w.lastAt ? ` · last event ${Math.round((Date.now() - w.lastAt) / 1000)}s ago` : ''
+          return `[${w.id}] ${w.state} · elapsed ${elapsed(w)} · last activity: ${w.last || 'none'}${quiet}`
+        }
+        try {
+          await $.fs.write(`${btwDir}/.keep`, '').catch(() => undefined)
+          await w.send({ type: 'prompt', message: `/btw ${reqId} ${q}` })
+          for (;;) {
+            const response = w.btwResponse as Worker['btwResponse'] // set by the event handler while we poll
+            if (response?.id === reqId && response.disposition !== 'handled') {
+              return reply('btw unavailable on this worker (extension not loaded)', true)
+            }
+            const raw = await $.fs.read(file).catch(() => undefined)
+            if (typeof raw === 'string' && raw.trim()) {
+              let data: any
+              try {
+                data = JSON.parse(raw)
+              } catch {
+                return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
+              }
+              if (data?.id === reqId) {
+                if (typeof data.error === 'string') return reply(`${context()}\n${data.error}`, true)
+                if (typeof data.a === 'string') return reply(`${context()}\n${data.a}`)
+                return reply(`${context()}\ninvalid btw result from ${w.id}`, true)
+              }
+            }
+            if (Date.now() >= deadline) return reply(`${context()}\nbtw timed out after ${Math.round(waitMs / 1000)}s.`, true)
+            await new Promise<void>(resolve => $.clock.after(Math.min(500, deadline - Date.now()), resolve))
+          }
+        } catch (err) {
+          return reply(`${context()}\nbtw failed: ${String(err)}`, true)
+        } finally {
+          if (w.btwPending === reqId) w.btwPending = undefined
+          if ((w.btwResponse as Worker['btwResponse'])?.id === reqId) w.btwResponse = undefined
+        }
+      }
+      spawnWorker = async (e: Record<string, any>, options: { model?: string; raceBatch?: string; caller?: Worker; onCreated?: (w: Worker) => void } = {}) => {
+        const notReady = await ensureSetup()
+        if (notReady) return text(notReady, true)
+        const catalog = await loadAgentCatalog()
+        const task = String(e.task ?? '').trim()
+        if (!task) return text('task is required', true)
+        if (e.after !== undefined && !Array.isArray(e.after)) return text('after must be an array of worker ids', true)
+        const after: string[] = [...new Set<string>((Array.isArray(e.after) ? e.after as unknown[] : []).map(id => String(id)))]
+        const missing = after.filter(id => !workers.has(id))
+        if (missing.length) return text(`unknown dependency worker id(s): ${missing.join(', ')}`, true)
+        const caller = options.caller
+        if (caller && caller.agent !== 'manager') return text('only a manager can launch sub-workers', true)
+        if (caller && after.some(id => workers.get(id)?.parent !== caller.id)) return text(`${after.find(id => workers.get(id)?.parent !== caller.id)} is not your sub-worker`, true)
+        if (!caller) {
+          const hidden = after.map(id => workers.get(id)).find((worker): worker is Worker => !!worker?.parent)
+          if (hidden) return text(orchestratorScopeError(hidden)!, true)
+        }
+        const dependencyReports: Record<string, string> = {}
+        for (const dependencyId of after) {
+          const upstream = workers.get(dependencyId)
+          if (upstream && isComplete(upstream)) dependencyReports[dependencyId] = dependencyResult(upstream)
+        }
+        if (sessionBudget !== undefined) {
+          const spent = (await read($, ledgerAtom)).cost
+          if (spent >= sessionBudget) return text(`session budget exceeded: spent ${money(spent)} of ${money(sessionBudget)}; /pi-budget off or raise the cap before spawning`, true)
+        }
+        if (caller?.maxCost && budgetCost(caller) >= caller.maxCost) return text(`manager subtree budget exceeded: spent ${money(budgetCost(caller))} of ${money(caller.maxCost)}`, true)
+        const owns = e.owns === undefined
+          ? undefined
+          : Array.isArray(e.owns) && e.owns.every((p: unknown) => typeof p === 'string' && p.trim())
+            ? (e.owns as string[]).map(p => p.trim())
+            : null
+        if (owns === null) return text('owns must be an array of non-empty glob patterns', true)
+        const agent = String(e.agent ?? DEFAULT_AGENT)
+        if (caller && agent === 'manager') return text('sub-workers cannot launch workers; only manager workers may spawn sub-workers', true)
+        const kind = catalog.agents[agent]
+        if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(catalog.agents).join(', ')}`, true)
+        if (e.maxSubWorkers !== undefined && agent !== 'manager') return text('maxSubWorkers is valid only for agent manager', true)
+        if (e.maxSubWorkers !== undefined && (!Number.isInteger(e.maxSubWorkers) || e.maxSubWorkers < 1 || e.maxSubWorkers > 20)) return text('maxSubWorkers must be an integer from 1 to 20', true)
+        if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+        if (e.maxCost !== undefined && (typeof e.maxCost !== 'number' || !Number.isFinite(e.maxCost) || e.maxCost <= 0)) return text('maxCost must be a positive USD number', true)
+        const codex = e.codex === true
+        if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
+        if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
+        let reviewBy: Worker['reviewBy']
+        if (e.reviewBy === true) reviewBy = {}
+        else if (e.reviewBy && typeof e.reviewBy === 'object' && !Array.isArray(e.reviewBy)) {
+          const config = e.reviewBy as Record<string, unknown>
+          if (config.codex !== undefined && typeof config.codex !== 'boolean') return text('reviewBy.codex must be boolean', true)
+          if (config.effort !== undefined && !THINKING_LEVELS.includes(String(config.effort))) return text(`reviewBy.effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+          if (config.codex === true && config.effort !== undefined) return text('a Codex reviewer runs at the /codex-worker effort; drop reviewBy.effort', true)
+          reviewBy = { codex: config.codex === true, ...(config.effort !== undefined ? { effort: String(config.effort) } : {}) }
+        } else if (e.reviewBy !== undefined && e.reviewBy !== false) return text('reviewBy must be a boolean or {codex?, effort?}', true)
+        if (reviewBy && !['dev', 'general'].includes(agent)) return text('reviewBy is available only for dev/general workers', true)
+        if (reviewBy?.codex && !(await codexReady())) return text(CODEX_LOGIN, true)
+        if (e.reviewRounds !== undefined && (typeof e.reviewRounds !== 'number' || !Number.isInteger(e.reviewRounds) || e.reviewRounds < 0 || e.reviewRounds > 2)) return text('reviewRounds must be an integer from 0 to 2', true)
+        const reviewRoundsLeft = reviewBy ? (e.reviewRounds === undefined ? 1 : Number(e.reviewRounds)) : undefined
+        const dir = caller ? caller.worktree ?? caller.dir : String(e.dir ?? cwd)
+        const startDir = caller ? workDir(caller) : dir
+        if (!(await B?.realPath(startDir))) return text(`dir ${startDir} does not exist`, true)
+        if (!caller && !(await insideRoots(dir))) {
+          return text(`dir ${dir} is outside the allowed roots (${roots().filter(Boolean).join(', ')}) or is a protected dir`, true)
+        }
+        const top = await $.process
+          .run(['git', 'rev-parse', '--show-toplevel'], { cwd: startDir, timeoutMs: 10_000 })
+          .catch(() => undefined)
+        const isGit = top?.exitCode === 0
+        // Without a dictionary every dev worker re-discovers the same layout (and the same traps). Make the supervisor seed one.
+        if (kind.tools?.includes('edit') !== false && e.noDict !== true) {
+          const have = Object.keys(((await $.store.get(DICT_PREFIX + (caller?.root ?? (isGit ? top!.stdout.trim() : dir))).catch(() => undefined)) as object | undefined) ?? {}).length
+          if (!have) {
+            return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, conventions, what workers must not touch. Put the checks workers should run themselves (tests, compile) in pi_tools, not the dictionary. Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
+          }
+        }
+        const projRoot = caller?.root ?? (isGit ? top!.stdout.trim() : dir)
+        if (owns?.length) {
+          for (const other of workers.values()) {
+            if (options.raceBatch && other.raceBatch === options.raceBatch) continue
+            if ((caller ? other.parent !== caller.id : other.parent !== undefined) || other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
+            const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
+            if (overlap) {
+              return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
+            }
+          }
+        }
+        let skills: Skill[] = []
+        if (Array.isArray(e.skills) && e.skills.length) {
+          const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
+          if (r.missing.length) {
+            return text(unknownSkills(r.missing, r.catalog), true)
+          }
+          if (r.found.length > MAX_SKILLS) {
+            return text(`${r.found.length} skills; push at most ${MAX_SKILLS} (the ones this task actually touches)`, true)
+          }
+          skills = r.found
+        }
+        const tools = await loadTools($, projRoot, dir)
+        let checks: string[] = []
+        if (!kind.tools || kind.tools.includes('bash')) {
+          if (Array.isArray(e.checks)) {
+            checks = (e.checks as unknown[]).map(String)
+            const unknown = checks.filter(n => !tools.checks[n])
+            if (unknown.length) {
+              return text(`unknown check(s) ${unknown.join(', ')}; the toolbox for ${projRoot} has: ${Object.keys(tools.checks).join(', ') || 'nothing (add some with pi_tools set)'}`, true)
+            }
+          } else checks = Object.entries(tools.checks).filter(([, c]) => c.required).map(([n]) => n)
+        }
+        const wantTree = caller ? isGit : agent === 'manager' ? isGit : e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
+        if (wantTree && !isGit) return text('worktree requested but dir is not a git repo', true)
+        if (caller && !isGit) return text('sub-workers require the manager integration branch to be a git worktree', true)
+        seq += 1
+        const id = `w${seq}`
+        let worktree: string | undefined
+        let branch: string | undefined
+        let sub: string | undefined
+        if (wantTree) {
+          const sourceRoot = top!.stdout.trim()
+          const root = caller?.root ?? sourceRoot
+          const parent = root.slice(0, root.lastIndexOf('/')) || '/'
+          const name = root.slice(root.lastIndexOf('/') + 1)
+          const tag = Date.now().toString(36)
+          const path = `${parent}/.omp-worktrees/${name}-${id}-${tag}`
+          const made = await $.process.run(['git', 'worktree', 'add', '-b', `omp/${name}-${id}-${tag}`, path], {
+            cwd: sourceRoot,
+            timeoutMs: 60_000,
+          })
+          if (made.exitCode !== 0) return text(`git worktree failed: ${made.stderr.trim()}`, true)
+          worktree = path
+          branch = `omp/${name}-${id}-${tag}`
+          // dir may be inside the repo: start the worker at the same place in its worktree (if it is tracked there).
+          const real = (await B?.realPath(startDir)) ?? startDir
+          const inside = real.startsWith(`${sourceRoot}/`) ? real.slice(sourceRoot.length) : ''
+          if (inside && (await $.fs.exists(`${path}${inside}`).catch(() => false))) sub = inside
+          // A Unity project's Library (the import cache) is not in git, and without it a worktree's first Unity run
+          // re-imports everything. Copy-on-write clone it (btrfs/xfs: instant, no extra space); skipped elsewhere.
+          const lib = `${sourceRoot}${tools.sub}/Library`
+          if ((await $.fs.exists(`${sourceRoot}${tools.sub}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) && (await $.fs.exists(lib).catch(() => false))) {
+            await $.process.run(['cp', '-a', '--reflink=always', lib, `${path}${tools.sub}/Library`], { timeoutMs: 120_000 }).catch(() => undefined)
+            // The clone must not claim the editor that has the main project open.
+            await $.process.run(['rm', '-f', `${path}${tools.sub}/Library/EditorInstance.json`], { timeoutMs: 10_000 }).catch(() => undefined)
+          }
+        }
+        for (const dependencyId of after) {
+          if (dependencyReports[dependencyId] !== undefined) continue
+          const upstream = workers.get(dependencyId)
+          if (upstream && isComplete(upstream)) dependencyReports[dependencyId] = dependencyResult(upstream)
+          else {
+            const snapshot = dependencySnapshots.get(dependencyId)
+            if (snapshot !== undefined) dependencyReports[dependencyId] = snapshot
+          }
+        }
+        const w: Worker = {
+          id,
+          parent: caller?.id,
+          maxSubWorkers: agent === 'manager' ? (typeof e.maxSubWorkers === 'number' ? e.maxSubWorkers : 3) : undefined,
+          title: String(e.title ?? clip(one(task), 40)),
+          task,
+          sessionId: sid,
+          pathKey: id,
+          after: after.length ? after : undefined,
+          dependencyReports: Object.keys(dependencyReports).length ? dependencyReports : undefined,
+          queuedReason: after.some(dep => dependencyReports[dep] === undefined && !isComplete(workers.get(dep)))
+            ? `waiting for dependencies: ${after.filter(dep => dependencyReports[dep] === undefined && !isComplete(workers.get(dep))).join(', ')}`
+            : 'waiting for a worker slot',
+          dir,
+          root: isGit ? top!.stdout.trim() : dir,
+          isGit,
+          worktree,
+          sub,
+          branch,
+          model: options.model ?? (codex ? resolveWorkerModel(agent, true, codexModel, modelOverrides, currentModel) : kind.model ?? resolveWorkerModel(agent, false, codexModel, modelOverrides, currentModel)),
+          codex: codex || undefined,
+          reviewBy,
+          reviewRoundsLeft,
+          raceBatch: options.raceBatch,
+          skills: skills.length ? skills : undefined,
+          owns,
+          agent,
+          agentType: kind,
+          mapGroup: typeof e._mapGroup === 'string' ? e._mapGroup : undefined,
+          mapParallel: typeof e._mapParallel === 'number' ? e._mapParallel : undefined,
+          state: 'queued',
+          startedAt: Date.now(),
+          files: new Set(),
+          reads: new Set(),
+          commands: [],
+          errors: [],
+          texts: [],
+          events: [],
+          last: 'starting',
+          steps: 0,
+          tokensIn: 0,
+          tokensOut: 0,
+          stderr: '',
+          isReported: false,
+          outTokens: 0,
+          genMs: 0,
+          spark: [],
+          maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
+          maxCost: typeof e.maxCost === 'number' ? e.maxCost : undefined,
+          verify: typeof e.verify === 'string' && e.verify.trim() ? e.verify.trim() : undefined,
+          verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
+          fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
+          expect: Array.isArray(e.expect) ? (e.expect as unknown[]).map(String).filter(Boolean) : undefined,
+          checks: checks.length ? checks : undefined,
+          effort: codex ? codexThinking : e.effort === undefined ? kind.effort : String(e.effort),
+          cost: 0,
+          warn: [],
+          tokensCache: 0,
+          sawEnd: false,
+          turnChars: 0,
+          ratio: 0.28,
+          win: [],
+          toolArgs: {},
+        }
+        // No worktree: remember when it started (to list what changed) and where the guard saves file originals (for pi_diff).
+        if (!w.worktree) {
+          w.marker = `${agentDir}/run/${workerPathKey(w, sid)}.marker`
+          w.snapDir = `${agentDir}/snap/${workerPathKey(w, sid)}`
+          await $.fs.write(w.marker, '').catch(() => undefined)
+          await $.fs.write(`${w.snapDir}/manifest.jsonl`, '').catch(() => undefined)
+        }
+        workers.set(id, w)
+        options.onCreated?.(w)
+        void B?.ledger(0, 0, 1)
+        scheduleQueue()
+        await sync()
+        const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
+        const position = [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === id) + 1
+        const outcome = w.state === 'running'
+          ? `started ${id} [${agent}] "${w.title}" in ${workDir(w)}`
+          : w.state === 'queued'
+            ? `queued ${id} at position ${position} (${w.queuedReason})`
+            : `created ${id}, but it failed: ${w.runError ?? w.state}`
+        return text(
+          `${outcome}` +
+            (skills.length ? `\nskills: ${skills.map(s => s.name).join(', ')}` : '') +
+            (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
+            (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
+        )
+      }
+      managerResponse = async (manager: Worker, id: string, ok: boolean, message: string) => {
+        const key = `${manager.id}:${id}`
+        if (managerResponses.has(key)) return
+        managerResponses.add(key)
+        const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr/res`
+        const safeId = /^[\w.-]+$/.test(id) ? id : 'invalid'
+        const tmp = `${dir}/${safeId}.json.tmp`
+        const dest = `${dir}/${safeId}.json`
+        await $.fs.write(tmp, JSON.stringify({ id: safeId, ok, text: message })).catch(() => undefined)
+        await $.process.run(['mv', '-f', tmp, dest], { timeoutMs: 10_000 }).catch(() => undefined)
+      }
+      managerWait = async (manager: Worker, args: Record<string, unknown>) => {
+        if (manager.agent !== 'manager') return { ok: false, text: 'manager stopped' }
+        const allChildren = childrenOf(manager)
+        const ids = Array.isArray(args.ids) && args.ids.length ? (args.ids as unknown[]).map(String) : allChildren.filter(child => child.state === 'running' || child.state === 'queued' || child.reviewPending).map(child => child.id)
+        const invalid = ids.find(id => workers.get(id)?.parent !== manager.id)
+        if (invalid) return { ok: false, text: `${invalid} is not your sub-worker` }
+        const list = ids.map(id => workers.get(id)!).filter(Boolean)
+        if (!list.length) return { ok: true, text: 'nothing to wait for' }
+        const asked = Number(args.timeoutSec ?? 120)
+        const limitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 120, 1), 600) * 1000
+        const mode = args.mode === 'all' ? 'all' : 'first'
+        const watched = list.map(w => ({ w, wasQueued: w.state === 'queued', warningCount: w.warn.length }))
+        const changed = () => watched.filter(({ w, wasQueued, warningCount }) => firstWaitChanged(w.state, wasQueued, w.warn.length, warningCount, w.reviewPending)).map(({ w }) => w)
+        const done = () => list.filter(w => w.state !== 'running' && w.state !== 'queued' && !w.reviewPending)
+        const shouldReturn = () => manager.state !== 'running' || (mode === 'first' ? changed().length > 0 : done().length === list.length)
+        if (!shouldReturn()) await new Promise<void>(resolve => {
+          let timer: { cancel: () => void } | undefined
+          const cleanup = () => { waitListeners.delete(onChange); timer?.cancel() }
+          const complete = () => { cleanup(); resolve() }
+          const onChange = () => { if (shouldReturn()) complete() }
+          waitListeners.add(onChange)
+          timer = $.clock.after(limitMs, complete)
+          onChange()
+        })
+        if (manager.state !== 'running') return { ok: false, text: 'manager stopped' }
+        const selected = mode === 'first' ? changed() : list
+        const reports: string[] = []
+        for (const child of selected) {
+          if (child.state !== 'running' && child.state !== 'queued' && !child.reviewPending) {
+            child.isReported = true
+            reports.push(await digest(child))
+          } else reports.push(`[${child.id}] ${child.state} — ${child.last}${child.warn.length ? ` ⚠ ${child.warn.join('; ')}` : ''}`)
+        }
+        if (!reports.length) reports.push(`no sub-worker changed within ${Math.round(limitMs / 1000)}s`)
+        return { ok: true, text: reports.join('\n\n') }
+      }
+      managerDiff = async (child: Worker, cap = 8000) => {
+        if (!child.worktree) return (await B?.nonGitDiff(child, cap)) ?? 'not ready'
+        const cwdW = workDir(child)
+        const stat = await B?.git(['diff', '--stat', 'HEAD'], cwdW)
+        const diff = await B?.git(['diff', 'HEAD'], cwdW)
+        const untracked = await B?.git(['ls-files', '--others', '--exclude-standard'], cwdW)
+        const fresh = (untracked?.stdout ?? '').split('\n').filter(file => file && !/__pycache__|\\.pyc$/.test(file))
+        const tracked = child.owns ? await B?.git(['diff', '--name-only', 'HEAD'], child.worktree) : undefined
+        const prefix = child.sub?.replace(/^\//, '')
+        const ownedFiles = [...(tracked?.stdout ?? '').split('\n').filter(Boolean), ...fresh.map(file => `${prefix ? `${prefix}/` : ''}${file}`)]
+        const outside = child.owns ? [...new Set(ownedFiles)].filter(file => !matchesAny(child.owns!, file)) : []
+        const ownershipWarning = outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}` : ''
+        const created: string[] = []
+        for (const file of fresh.slice(0, 8)) {
+          const item = await $.process.run(['git', 'diff', '--no-index', '--', '/dev/null', file], { cwd: cwdW, timeoutMs: 20_000 }).catch(() => undefined)
+          if (item?.stdout.trim()) created.push(clip(item.stdout.trimEnd(), 2500))
+        }
+        return clip([stat?.stdout.trim() || '(no tracked changes)', ownershipWarning, fresh.length ? `untracked (${fresh.length}):\n${fresh.join('\n')}` : '', clip(diff?.stdout ?? '', cap), ...created].filter(Boolean).join('\n\n'), cap)
+      }
+      managerSend = async (manager: Worker, child: Worker, args: Record<string, unknown>) => {
+        const message = String(args.message ?? '').trim()
+        if (!message) return { ok: false, text: 'message is required' }
+        if (child.reviewPending) return { ok: false, text: `${child.id} is under review` }
+        const interrupt = args.interrupt === true
+        if (child.state === 'running' && !interrupt) return { ok: false, text: `${child.id} is still running; pass interrupt:true to redirect it` }
+        if (child.state === 'running') {
+          if (!child.send) return { ok: false, text: `${child.id} has no live process to interrupt` }
+          child.interrupting = true
+          await child.send({ type: 'abort' })
+          const settled = await new Promise<boolean>(resolve => {
+            const waiters = (child.settleWaiters ??= [])
+            let timer: { cancel: () => void } | undefined
+            const remove = () => { const at = waiters.indexOf(done); if (at >= 0) waiters.splice(at, 1); timer?.cancel() }
+            const done = () => { remove(); resolve(true) }
+            waiters.push(done)
+            timer = $.clock.after(15_000, () => { remove(); resolve(child.state !== 'running') })
+          })
+          child.interrupting = false
+          if (!settled || child.state === 'running') return { ok: false, text: `${child.id} did not settle within 15 seconds` }
+        }
+        if (!child.send && !child.session && !child.restored && !child.interruptedQueued) return { ok: false, text: `${child.id} has no live process or session to continue` }
+        if (!child.send && !canStart(child)) return { ok: false, text: 'no worker slot is available for this follow-up' }
+        child.texts = []
+        child.errors = []
+        B?.launch(child, message)
+        await sync()
+        return { ok: true, text: `sent to ${child.id}${child.send ? ' (same process, context kept)' : ' (resuming saved session)'}` }
+      }
+      managerMerge = async (manager: Worker, child: Worker, args: Record<string, unknown>) => {
+        const run = mergeChain.then(async () => {
+          if (!child.worktree || !child.branch || !manager.worktree) return { ok: false, text: `${child.id} has no mergeable worktree` }
+          if (child.state === 'running' || child.state === 'queued' || child.reviewPending) return { ok: false, text: `${child.id} is still running or queued` }
+          const targetDir = manager.worktree!
+          const dirty = await B?.git(['status', '--porcelain', '--untracked-files=no'], targetDir)
+          if (dirty?.stdout.trim()) return { ok: false, text: `manager tree ${targetDir} has tracked changes; commit or stash them first` }
+          await B?.git(['add', '-A', '--', '.', ':(exclude,glob)**/__pycache__/**', ':(exclude,glob)**/*.pyc', ':(exclude,glob)**/.DS_Store'], child.worktree!)
+          const markers = await B?.git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>) ', '--', '.'], child.worktree!)
+          if (markers?.exitCode === 0 && markers.stdout.trim()) return { ok: false, text: `${child.id} still has conflict markers: ${markers.stdout.trim().split('\n').slice(0, 4).join('; ')}` }
+          const merging = (await B?.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], child.worktree!))?.exitCode === 0
+          const staged = await B?.git(['diff', '--cached', '--quiet'], child.worktree!)
+          if (staged?.exitCode === 1 || merging) {
+            const committed = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '--allow-empty', '-m', `${child.title} (${child.id})`], child.worktree!)
+            if (committed?.exitCode !== 0) return { ok: false, text: `commit failed: ${committed?.stderr.trim() ?? 'unknown'}` }
+          }
+          const target = await B?.git(['rev-parse', 'HEAD'], targetDir)
+          if (target?.exitCode !== 0) return { ok: false, text: 'could not read manager integration branch HEAD' }
+          const sha = target!.stdout.trim()
+          const ancestor = await B?.git(['merge-base', '--is-ancestor', sha, child.branch!], targetDir)
+          if (ancestor?.exitCode !== 0) {
+            const rebase = await B?.git(['rebase', '--rebase-merges', sha], child.worktree!)
+            if (rebase?.exitCode !== 0) {
+              await B?.git(['rebase', '--abort'], child.worktree!)
+              return { ok: false, text: `refusing to merge ${child.id}: rebase onto manager HEAD failed.\n${clip(one(rebase?.stderr.trim() || rebase?.stdout.trim() || 'git rebase failed'), 1000)}` }
+            }
+          }
+          const ahead = await B?.git(['rev-list', '--count', `${sha}..${child.branch}`], targetDir)
+          if (Number(ahead?.stdout.trim() ?? 0) === 0) return { ok: true, text: `${child.id}: nothing to merge` }
+          const merged = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-ff', '-m', String(args.message ?? `sub merge ${child.id}: ${child.title}`), child.branch!], targetDir)
+          if (merged?.exitCode !== 0) {
+            const conflicts = await B?.git(['diff', '--name-only', '--diff-filter=U'], targetDir)
+            await B?.git(['merge', '--abort'], targetDir)
+            const head = (await B?.git(['rev-parse', 'HEAD'], targetDir))?.stdout.trim()
+            const stagedConflict = head ? await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-commit', '--no-ff', head], child.worktree!) : undefined
+            const handed = stagedConflict && stagedConflict.exitCode !== 0 ? (await B?.git(['diff', '--name-only', '--diff-filter=U'], child.worktree!))?.stdout.trim() : undefined
+            return { ok: false, text: `merge conflict, aborted; manager branch is untouched. conflicting: ${conflicts?.stdout.trim().split('\n').join(', ') || merged?.stderr.trim()}.${handed ? ` The same conflict is now in ${child.id}'s worktree as <<<<<<< markers (${handed.split('\n').join(', ')}); use sub_send to resolve it, run checks, then sub_diff and sub_merge again.` : ''}` }
+          }
+          const mergeSha = (await B?.git(['rev-parse', 'HEAD'], targetDir))?.stdout.trim()
+          if (!mergeSha) return { ok: false, text: 'merge succeeded but could not read the merge commit' }
+          const toolbox = await loadTools($, manager.root, targetDir)
+          const required = Object.entries(toolbox.checks).filter(([, check]) => check.required).map(([name]) => name)
+          const tmp = `${agentDir}/tmp/${sid}-${manager.id}-${child.id}-merge-checks`
+          let failed: { name: string; exit: number; tail: string } | undefined
+          if (required.length) {
+            await $.process.run(['mkdir', '-p', tmp], { timeoutMs: 10_000 }).catch(() => undefined)
+            const lockKey = [...`${manager.root}${toolbox.sub}`].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) >>> 0, 7).toString(36)
+            const checks = Object.fromEntries(Object.entries(toolbox.checks).map(([name, check]) => [name, { ...check, lock: `${agentDir}/locks/${name}-${lockKey}.lock` }]))
+            const checksFile = `${tmp}/checks.json`
+            await $.fs.write(checksFile, JSON.stringify({ cwd: `${targetDir}${toolbox.sub}`, checks }, null, 2))
+            for (const name of required) {
+              const check = toolbox.checks[name]!
+              const result = await $.process.run(['bash', '-c', `check ${name}`], { cwd: `${targetDir}${toolbox.sub}`, env: { PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`, HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_CHECKS_FILE: checksFile, PI_CHECKS_REQUIRED: required.join(','), TMPDIR: tmp, ...(apiKey ? { OPENCODE_GO_API_KEY: apiKey } : {}) }, timeoutMs: Math.min(3600, check.timeoutSec) * 1000 }).catch(() => undefined)
+              if (result?.exitCode !== 0) { failed = { name, exit: result?.exitCode ?? -1, tail: clip(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim().slice(-VERIFY_TAIL * 2), VERIFY_TAIL) }; break }
+            }
+            await $.process.run(['rm', '-rf', tmp], { timeoutMs: 10_000 }).catch(() => undefined)
+          }
+          if (failed) {
+            const reverted = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'revert', '--no-edit', '-m', '1', mergeSha], targetDir)
+            return { ok: false, text: `post-merge check ${failed.name} failed (exit ${failed.exit}); ${reverted?.exitCode === 0 ? 'merge reverted' : 'automatic revert failed; manager branch may need manual recovery'}.\n${failed.tail}` }
+          }
+          const stat = await B?.git(['diff', '--stat', `${sha}..${mergeSha}`], targetDir)
+          return { ok: true, text: `merged ${child.branch} into manager ${manager.id}${required.length ? `; required checks passed: ${required.join(', ')}` : ''}\n${stat?.stdout.trim() ?? ''}` }
+        })
+        mergeChain = run.then(() => undefined, () => undefined)
+        return await run
+      }
+      managerOperation = async (manager: Worker, tool: string, args: Record<string, unknown>): Promise<{ ok: boolean; text: string }> => {
+        if (manager.agent !== 'manager' || manager.state !== 'running') return { ok: false, text: 'manager stopped' }
+        if (tool === 'sub_status') return { ok: true, text: managerStatus(manager) }
+        if (tool === 'sub_wait') return managerWait(manager, args)
+        if (tool === 'sub_spawn') {
+          const task = String(args.task ?? '').trim()
+          if (!task) return { ok: false, text: 'task is required' }
+          const agent = String(args.agent ?? DEFAULT_AGENT)
+          if (agent === 'manager') return { ok: false, text: 'sub-workers cannot launch workers; only manager workers may spawn sub-workers' }
+          const result = await spawnWorker!({ ...args, task, agent, dir: workDir(manager), worktree: true }, { caller: manager })
+          const answer = String(result?.result ?? result?.deny ?? '')
+          const childId = /\b(w\d+)\b/.exec(answer)?.[1]
+          return result?.deny || !childId ? { ok: false, text: answer || 'sub-worker spawn failed' } : { ok: true, text: childId }
+        }
+        const picked = managerChild(manager, args)
+        if (picked.error) return { ok: false, text: picked.error }
+        const child = picked.child!
+        if (tool === 'sub_digest') {
+          if (child.state !== 'running' && child.state !== 'queued' && !child.reviewPending) child.isReported = true
+          return { ok: true, text: await digest(child, args.detail === 'full') }
+        }
+        if (tool === 'sub_diff') return { ok: true, text: await managerDiff(child, Math.min(Math.max(Number(args.maxChars ?? 8000), 500), 40000)) }
+        if (tool === 'sub_send') return managerSend(manager, child, args)
+        if (tool === 'sub_merge') return managerMerge(manager, child, args)
+        if (tool === 'sub_btw') {
+          const result = await askBtw(child.id, args.question, args.timeoutSec, args.force, manager)
+          return { ok: !result.error, text: result.message }
+        }
+        if (tool === 'sub_log') {
+          const events = child.events ?? []
+          const total = child.eventTotal ?? events.length
+          const start = Math.max(0, total - events.length)
+          const requested = Number(args.count ?? 40)
+          const count = Math.min(Math.max(Number.isFinite(requested) ? Math.floor(requested) : 40, 1), 200)
+          const from = Math.max(start, args.from == null ? total - count : Math.floor(Number(args.from) || 0))
+          const page = events.map((line, index) => ({ index: start + index, line })).filter(item => item.index >= from).slice(0, count)
+          return { ok: true, text: [`[${child.id}] log: ${total} total events; retained window ${events.length ? `${start}..${total - 1}` : 'empty'}; page from ${from}`, ...page.map(item => `${item.index}: ${item.line}`)].join('\n') }
+        }
+        if (tool === 'sub_kill') {
+          if (child.state === 'queued') {
+            child.killed = true; child.state = 'killed'; child.endedAt = Date.now(); child.last = 'removed from the spawn queue'
+            scheduleQueue(); notifyWaiters(); void B?.finished(child)
+            return { ok: true, text: `removed queued sub-worker ${child.id}` }
+          }
+          if (child.state !== 'running') return { ok: true, text: `${child.id} is already ${child.state}` }
+          child.killed = true
+          void child.send?.({ type: 'abort' })
+          child.stop?.()
+          finish(child)
+          return { ok: true, text: `killed ${child.id}` }
+        }
+        if (tool === 'sub_cleanup') {
+          if (child.state === 'running' || child.reviewPending) return { ok: false, text: `${child.id} is still running or under review` }
+          if (child.worktree && child.branch) {
+            if (args.force !== true) {
+              const dirty = await B?.git(['status', '--porcelain'], child.worktree)
+              const ahead = await B?.git(['rev-list', '--count', `HEAD..${child.branch}`], child.dir)
+              if (dirty?.stdout.trim() || Number(ahead?.stdout.trim() ?? 0) > 0) return { ok: false, text: `${child.id} has unmerged work; sub_merge it first or pass force:true` }
+            }
+            const removed = await B?.git(['worktree', 'remove', '--force', child.worktree], child.dir)
+            if (removed?.exitCode !== 0) return { ok: false, text: `worktree remove failed: ${removed?.stderr.trim()}` }
+            await B?.git(['branch', '-D', child.branch], child.dir)
+          }
+          const leftovers = [workerTmpDir(agentDir, child, sid), child.snapDir, child.marker, child.btwDir, workerCommandFile(agentDir, child, sid)].filter((path): path is string => !!path)
+          await $.process.run(['rm', '-rf', ...leftovers], { timeoutMs: 15_000 }).catch(() => undefined)
+          manager.subCost = (manager.subCost ?? 0) + child.cost
+          manager.subTokensIn = (manager.subTokensIn ?? 0) + child.tokensIn
+          manager.subTokensOut = (manager.subTokensOut ?? 0) + child.tokensOut
+          manager.subTokensCache = (manager.subTokensCache ?? 0) + child.tokensCache
+          manager.subSteps = (manager.subSteps ?? 0) + child.steps
+          workers.delete(child.id)
+          scheduleQueue(); await sync()
+          return { ok: true, text: `cleaned up ${child.id}` }
+        }
+        return { ok: false, text: 'unknown tool' }
+      }
+      scanManagerRequests = async () => {
+        const managers = [...workers.values()].filter(worker => worker.agent === 'manager' && worker.state === 'running')
+        for (const manager of managers) {
+          const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr/req`
+          const entries = (await $.fs.list(dir).catch(() => [])) as { name: string; kind?: string }[]
+          for (const entry of entries) {
+            if (!entry.name.endsWith('.json')) continue
+            const raw = await $.fs.read(`${dir}/${entry.name}`).catch(() => undefined)
+            await $.process.run(['rm', '-f', `${dir}/${entry.name}`], { timeoutMs: 5000 }).catch(() => undefined)
+            if (typeof raw !== 'string') continue
+            let parsed: unknown
+            try { parsed = JSON.parse(raw) } catch { parsed = undefined }
+            const request = validateManagerRequest(parsed)
+            const requestError = 'error' in request ? request.error : undefined
+            const validRequest = request as { id: string; tool: string; args: Record<string, unknown> }
+            const id = requestError ? entry.name.slice(0, -5) : validRequest.id
+            const seen = managerRequestSets.get(manager.id) ?? new Set<string>()
+            managerRequestSets.set(manager.id, seen)
+            if (seen.has(id)) continue
+            seen.add(id)
+            const active = managerInflight.get(manager.id) ?? new Set<string>()
+            managerInflight.set(manager.id, active)
+            active.add(id)
+            manager.lastAt = Date.now()
+            if (requestError) {
+              void managerResponse(manager, id, false, requestError).finally(() => active.delete(id))
+              continue
+            }
+            void (async () => {
+              try {
+                const result = await managerOperation(manager, validRequest.tool, validRequest.args)
+                if (manager.state !== 'running') await managerResponse(manager, id, false, 'manager stopped')
+                else await managerResponse(manager, id, result.ok, result.text)
+              } catch (error) {
+                await managerResponse(manager, id, false, String((error as Error)?.message ?? error))
+              } finally {
+                active.delete(id)
+              }
+            })()
+          }
+        }
+      }
+      managerBridgeStop = manager => {
+        const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr`
+        const active = managerInflight.get(manager.id) ?? new Set<string>()
+        for (const id of active) void managerResponse(manager, id, false, 'manager stopped')
+        void (async () => {
+          const entries = (await $.fs.list(`${dir}/req`).catch(() => [])) as { name: string }[]
+          for (const entry of entries) {
+            if (!entry.name.endsWith('.json')) continue
+            const file = `${dir}/req/${entry.name}`
+            const raw = await $.fs.read(file).catch(() => undefined)
+            await $.process.run(['rm', '-f', file], { timeoutMs: 5000 }).catch(() => undefined)
+            let id = entry.name.slice(0, -5)
+            try { const parsed = JSON.parse(String(raw ?? '')); if (typeof parsed?.id === 'string') id = parsed.id } catch { /* use the filename */ }
+            await managerResponse(manager, id, false, 'manager stopped')
+          }
+          notifyWaiters()
+        })()
+      }
     return next(e)
   })
 
@@ -2791,7 +3330,7 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'pi-agents' }, async $ => {
-    const { agents, warnings } = await loadAgentCatalog($)
+    const { agents, warnings } = await loadAgentCatalog()
     const lines = Object.entries(agents).map(([name, kind]) => {
       const report = kind.report === 'detailed' ? 'findings (verbatim)' : 'summary'
       const tools = kind.tools?.join(', ') ?? '(Pi default tools)'
@@ -2829,7 +3368,7 @@ export const register: Register = on => {
   on('command.run', { command: 'btw' }, async ($, e) => {
     const [id = '', ...question] = String((e as { args?: string }).args ?? '').trim().split(/\s+/)
     if (!id) return { text: 'usage: /btw <id> [question]' }
-    const result = await askBtw($, id, question.join(' '), 60, false)
+    const result = await askBtw(id, question.join(' '), 60, false)
     return { text: result.message }
   })
 
@@ -2936,249 +3475,8 @@ export const register: Register = on => {
     return { text: `${workers.size} worker(s), ${running()} running.` }
   })
 
-  spawnWorker = async ($: any, e: Record<string, any>, options: { model?: string; raceBatch?: string; caller?: Worker; onCreated?: (w: Worker) => void } = {}) => {
-    const notReady = await ensureSetup()
-    if (notReady) return text(notReady, true)
-    const catalog = await loadAgentCatalog($)
-    const task = String(e.task ?? '').trim()
-    if (!task) return text('task is required', true)
-    if (e.after !== undefined && !Array.isArray(e.after)) return text('after must be an array of worker ids', true)
-    const after: string[] = [...new Set<string>((Array.isArray(e.after) ? e.after as unknown[] : []).map(id => String(id)))]
-    const missing = after.filter(id => !workers.has(id))
-    if (missing.length) return text(`unknown dependency worker id(s): ${missing.join(', ')}`, true)
-    const caller = options.caller
-    if (caller && caller.agent !== 'manager') return text('only a manager can launch sub-workers', true)
-    if (caller && after.some(id => workers.get(id)?.parent !== caller.id)) return text(`${after.find(id => workers.get(id)?.parent !== caller.id)} is not your sub-worker`, true)
-    if (!caller) {
-      const hidden = after.map(id => workers.get(id)).find((worker): worker is Worker => !!worker?.parent)
-      if (hidden) return text(orchestratorScopeError(hidden)!, true)
-    }
-    const dependencyReports: Record<string, string> = {}
-    for (const dependencyId of after) {
-      const upstream = workers.get(dependencyId)
-      if (upstream && isComplete(upstream)) dependencyReports[dependencyId] = dependencyResult(upstream)
-    }
-    if (sessionBudget !== undefined) {
-      const spent = (await read($, ledgerAtom)).cost
-      if (spent >= sessionBudget) return text(`session budget exceeded: spent ${money(spent)} of ${money(sessionBudget)}; /pi-budget off or raise the cap before spawning`, true)
-    }
-    if (caller?.maxCost && budgetCost(caller) >= caller.maxCost) return text(`manager subtree budget exceeded: spent ${money(budgetCost(caller))} of ${money(caller.maxCost)}`, true)
-    const owns = e.owns === undefined
-      ? undefined
-      : Array.isArray(e.owns) && e.owns.every((p: unknown) => typeof p === 'string' && p.trim())
-        ? (e.owns as string[]).map(p => p.trim())
-        : null
-    if (owns === null) return text('owns must be an array of non-empty glob patterns', true)
-    const agent = String(e.agent ?? DEFAULT_AGENT)
-    if (caller && agent === 'manager') return text('sub-workers cannot launch workers; only manager workers may spawn sub-workers', true)
-    const kind = catalog.agents[agent]
-    if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(catalog.agents).join(', ')}`, true)
-    if (e.maxSubWorkers !== undefined && agent !== 'manager') return text('maxSubWorkers is valid only for agent manager', true)
-    if (e.maxSubWorkers !== undefined && (!Number.isInteger(e.maxSubWorkers) || e.maxSubWorkers < 1 || e.maxSubWorkers > 20)) return text('maxSubWorkers must be an integer from 1 to 20', true)
-    if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
-    if (e.maxCost !== undefined && (typeof e.maxCost !== 'number' || !Number.isFinite(e.maxCost) || e.maxCost <= 0)) return text('maxCost must be a positive USD number', true)
-    const codex = e.codex === true
-    if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
-    if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
-    let reviewBy: Worker['reviewBy']
-    if (e.reviewBy === true) reviewBy = {}
-    else if (e.reviewBy && typeof e.reviewBy === 'object' && !Array.isArray(e.reviewBy)) {
-      const config = e.reviewBy as Record<string, unknown>
-      if (config.codex !== undefined && typeof config.codex !== 'boolean') return text('reviewBy.codex must be boolean', true)
-      if (config.effort !== undefined && !THINKING_LEVELS.includes(String(config.effort))) return text(`reviewBy.effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
-      if (config.codex === true && config.effort !== undefined) return text('a Codex reviewer runs at the /codex-worker effort; drop reviewBy.effort', true)
-      reviewBy = { codex: config.codex === true, ...(config.effort !== undefined ? { effort: String(config.effort) } : {}) }
-    } else if (e.reviewBy !== undefined && e.reviewBy !== false) return text('reviewBy must be a boolean or {codex?, effort?}', true)
-    if (reviewBy && !['dev', 'general'].includes(agent)) return text('reviewBy is available only for dev/general workers', true)
-    if (reviewBy?.codex && !(await codexReady())) return text(CODEX_LOGIN, true)
-    if (e.reviewRounds !== undefined && (typeof e.reviewRounds !== 'number' || !Number.isInteger(e.reviewRounds) || e.reviewRounds < 0 || e.reviewRounds > 2)) return text('reviewRounds must be an integer from 0 to 2', true)
-    const reviewRoundsLeft = reviewBy ? (e.reviewRounds === undefined ? 1 : Number(e.reviewRounds)) : undefined
-    const dir = caller ? caller.worktree ?? caller.dir : String(e.dir ?? cwd)
-    const startDir = caller ? workDir(caller) : dir
-    if (!(await B?.realPath(startDir))) return text(`dir ${startDir} does not exist`, true)
-    if (!caller && !(await insideRoots(dir))) {
-      return text(`dir ${dir} is outside the allowed roots (${roots().filter(Boolean).join(', ')}) or is a protected dir`, true)
-    }
-    const top = await $.process
-      .run(['git', 'rev-parse', '--show-toplevel'], { cwd: startDir, timeoutMs: 10_000 })
-      .catch(() => undefined)
-    const isGit = top?.exitCode === 0
-    // Without a dictionary every dev worker re-discovers the same layout (and the same traps). Make the supervisor seed one.
-    if (kind.tools?.includes('edit') !== false && e.noDict !== true) {
-      const have = Object.keys(((await $.store.get(DICT_PREFIX + (caller?.root ?? (isGit ? top!.stdout.trim() : dir))).catch(() => undefined)) as object | undefined) ?? {}).length
-      if (!have) {
-        return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, conventions, what workers must not touch. Put the checks workers should run themselves (tests, compile) in pi_tools, not the dictionary. Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
-      }
-    }
-    const projRoot = caller?.root ?? (isGit ? top!.stdout.trim() : dir)
-    if (owns?.length) {
-      for (const other of workers.values()) {
-        if (options.raceBatch && other.raceBatch === options.raceBatch) continue
-        if ((caller ? other.parent !== caller.id : other.parent !== undefined) || other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
-        const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
-        if (overlap) {
-          return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
-        }
-      }
-    }
-    let skills: Skill[] = []
-    if (Array.isArray(e.skills) && e.skills.length) {
-      const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
-      if (r.missing.length) {
-        return text(unknownSkills(r.missing, r.catalog), true)
-      }
-      if (r.found.length > MAX_SKILLS) {
-        return text(`${r.found.length} skills; push at most ${MAX_SKILLS} (the ones this task actually touches)`, true)
-      }
-      skills = r.found
-    }
-    const tools = await loadTools($, projRoot, dir)
-    let checks: string[] = []
-    if (!kind.tools || kind.tools.includes('bash')) {
-      if (Array.isArray(e.checks)) {
-        checks = (e.checks as unknown[]).map(String)
-        const unknown = checks.filter(n => !tools.checks[n])
-        if (unknown.length) {
-          return text(`unknown check(s) ${unknown.join(', ')}; the toolbox for ${projRoot} has: ${Object.keys(tools.checks).join(', ') || 'nothing (add some with pi_tools set)'}`, true)
-        }
-      } else checks = Object.entries(tools.checks).filter(([, c]) => c.required).map(([n]) => n)
-    }
-    const wantTree = caller ? isGit : agent === 'manager' ? isGit : e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
-    if (wantTree && !isGit) return text('worktree requested but dir is not a git repo', true)
-    if (caller && !isGit) return text('sub-workers require the manager integration branch to be a git worktree', true)
-    seq += 1
-    const id = `w${seq}`
-    let worktree: string | undefined
-    let branch: string | undefined
-    let sub: string | undefined
-    if (wantTree) {
-      const sourceRoot = top!.stdout.trim()
-      const root = caller?.root ?? sourceRoot
-      const parent = root.slice(0, root.lastIndexOf('/')) || '/'
-      const name = root.slice(root.lastIndexOf('/') + 1)
-      const tag = Date.now().toString(36)
-      const path = `${parent}/.omp-worktrees/${name}-${id}-${tag}`
-      const made = await $.process.run(['git', 'worktree', 'add', '-b', `omp/${name}-${id}-${tag}`, path], {
-        cwd: sourceRoot,
-        timeoutMs: 60_000,
-      })
-      if (made.exitCode !== 0) return text(`git worktree failed: ${made.stderr.trim()}`, true)
-      worktree = path
-      branch = `omp/${name}-${id}-${tag}`
-      // dir may be inside the repo: start the worker at the same place in its worktree (if it is tracked there).
-      const real = (await B?.realPath(startDir)) ?? startDir
-      const inside = real.startsWith(`${sourceRoot}/`) ? real.slice(sourceRoot.length) : ''
-      if (inside && (await $.fs.exists(`${path}${inside}`).catch(() => false))) sub = inside
-      // A Unity project's Library (the import cache) is not in git, and without it a worktree's first Unity run
-      // re-imports everything. Copy-on-write clone it (btrfs/xfs: instant, no extra space); skipped elsewhere.
-      const lib = `${sourceRoot}${tools.sub}/Library`
-      if ((await $.fs.exists(`${sourceRoot}${tools.sub}/ProjectSettings/ProjectVersion.txt`).catch(() => false)) && (await $.fs.exists(lib).catch(() => false))) {
-        await $.process.run(['cp', '-a', '--reflink=always', lib, `${path}${tools.sub}/Library`], { timeoutMs: 120_000 }).catch(() => undefined)
-        // The clone must not claim the editor that has the main project open.
-        await $.process.run(['rm', '-f', `${path}${tools.sub}/Library/EditorInstance.json`], { timeoutMs: 10_000 }).catch(() => undefined)
-      }
-    }
-    for (const dependencyId of after) {
-      if (dependencyReports[dependencyId] !== undefined) continue
-      const upstream = workers.get(dependencyId)
-      if (upstream && isComplete(upstream)) dependencyReports[dependencyId] = dependencyResult(upstream)
-      else {
-        const snapshot = dependencySnapshots.get(dependencyId)
-        if (snapshot !== undefined) dependencyReports[dependencyId] = snapshot
-      }
-    }
-    const w: Worker = {
-      id,
-      parent: caller?.id,
-      maxSubWorkers: agent === 'manager' ? (typeof e.maxSubWorkers === 'number' ? e.maxSubWorkers : 3) : undefined,
-      title: String(e.title ?? clip(one(task), 40)),
-      task,
-      sessionId: sid,
-      pathKey: id,
-      after: after.length ? after : undefined,
-      dependencyReports: Object.keys(dependencyReports).length ? dependencyReports : undefined,
-      queuedReason: after.some(dep => dependencyReports[dep] === undefined && !isComplete(workers.get(dep)))
-        ? `waiting for dependencies: ${after.filter(dep => dependencyReports[dep] === undefined && !isComplete(workers.get(dep))).join(', ')}`
-        : 'waiting for a worker slot',
-      dir,
-      root: isGit ? top!.stdout.trim() : dir,
-      isGit,
-      worktree,
-      sub,
-      branch,
-      model: options.model ?? (codex ? resolveWorkerModel(agent, true, codexModel, modelOverrides, currentModel) : kind.model ?? resolveWorkerModel(agent, false, codexModel, modelOverrides, currentModel)),
-      codex: codex || undefined,
-      reviewBy,
-      reviewRoundsLeft,
-      raceBatch: options.raceBatch,
-      skills: skills.length ? skills : undefined,
-      owns,
-      agent,
-      agentType: kind,
-      mapGroup: typeof e._mapGroup === 'string' ? e._mapGroup : undefined,
-      mapParallel: typeof e._mapParallel === 'number' ? e._mapParallel : undefined,
-      state: 'queued',
-      startedAt: Date.now(),
-      files: new Set(),
-      reads: new Set(),
-      commands: [],
-      errors: [],
-      texts: [],
-      events: [],
-      last: 'starting',
-      steps: 0,
-      tokensIn: 0,
-      tokensOut: 0,
-      stderr: '',
-      isReported: false,
-      outTokens: 0,
-      genMs: 0,
-      spark: [],
-      maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
-      maxCost: typeof e.maxCost === 'number' ? e.maxCost : undefined,
-      verify: typeof e.verify === 'string' && e.verify.trim() ? e.verify.trim() : undefined,
-      verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
-      fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
-      expect: Array.isArray(e.expect) ? (e.expect as unknown[]).map(String).filter(Boolean) : undefined,
-      checks: checks.length ? checks : undefined,
-      effort: codex ? codexThinking : e.effort === undefined ? kind.effort : String(e.effort),
-      cost: 0,
-      warn: [],
-      tokensCache: 0,
-      sawEnd: false,
-      turnChars: 0,
-      ratio: 0.28,
-      win: [],
-      toolArgs: {},
-    }
-    // No worktree: remember when it started (to list what changed) and where the guard saves file originals (for pi_diff).
-    if (!w.worktree) {
-      w.marker = `${agentDir}/run/${workerPathKey(w, sid)}.marker`
-      w.snapDir = `${agentDir}/snap/${workerPathKey(w, sid)}`
-      await $.fs.write(w.marker, '').catch(() => undefined)
-      await $.fs.write(`${w.snapDir}/manifest.jsonl`, '').catch(() => undefined)
-    }
-    workers.set(id, w)
-    options.onCreated?.(w)
-    void B?.ledger(0, 0, 1)
-    scheduleQueue()
-    await sync()
-    const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
-    const position = [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === id) + 1
-    const outcome = w.state === 'running'
-      ? `started ${id} [${agent}] "${w.title}" in ${workDir(w)}`
-      : w.state === 'queued'
-        ? `queued ${id} at position ${position} (${w.queuedReason})`
-        : `created ${id}, but it failed: ${w.runError ?? w.state}`
-    return text(
-      `${outcome}` +
-        (skills.length ? `\nskills: ${skills.map(s => s.name).join(', ')}` : '') +
-        (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
-        (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
-    )
-  }
 
-  on('tool.call', { tool: 'mcp__omp-conductor__pi_spawn' }, async ($, e) => spawnWorker!($, e))
+  on('tool.call', { tool: 'mcp__omp-conductor__pi_spawn' }, async ($, e) => spawnWorker!(e))
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_map' }, async ($, e) => {
     const template = String(e.template ?? '').trim()
@@ -3194,7 +3492,7 @@ export const register: Register = on => {
       const replace = (value: unknown) => typeof value === 'string' ? value.replaceAll('{item}', item) : value
       const owns = Array.isArray(e.owns) ? e.owns.map(replace) : e.owns
       const expect = Array.isArray(e.expect) ? e.expect.map(replace) : e.expect
-      const result = await spawnWorker!($, {
+      const result = await spawnWorker!({
         ...e,
         task: template.replaceAll('{item}', item),
         title: replace(e.title),
@@ -3221,7 +3519,7 @@ export const register: Register = on => {
     if (!goal) return text('goal is required', true)
     const dir = String(e.dir ?? cwd)
     const brief = `Inspect this project and plan the following goal; do not make any changes. Return a compact task DAG with explicit disjoint owns globs and dependencies, using the required PLAN JSON format in your system instructions. Do not spawn tasks.\n\nGOAL:\n${goal}`
-    const result = await spawnWorker!($, { task: brief, title: `plan: ${clip(one(goal), 32)}`, agent: 'planner', dir, noDict: true, worktree: false })
+    const result = await spawnWorker!({ task: brief, title: `plan: ${clip(one(goal), 32)}`, agent: 'planner', dir, noDict: true, worktree: false })
     return result
   })
 
@@ -3230,7 +3528,7 @@ export const register: Register = on => {
     if (!planner) return text(`no planner worker ${String(e.planFrom)}`, true)
     if (planner.agent !== 'planner') return text(`${planner.id} is ${planner.agent}, not a planner`, true)
     if (planner.state === 'running' || planner.state === 'queued') return text(`${planner.id} is ${planner.state}; wait for its PLAN report first`, true)
-    const catalog = await loadAgentCatalog($)
+    const catalog = await loadAgentCatalog()
     const parsed = parsePlan(planner.texts.at(-1) ?? '', Object.keys(catalog.agents))
     if (parsed.error) return text(parsed.error, true)
     const plan = parsed.plan!
@@ -3247,7 +3545,7 @@ export const register: Register = on => {
     const ids: Record<string, string> = {}
     const errors: string[] = []
     for (const task of ordered) {
-      const result = await spawnWorker!($, {
+      const result = await spawnWorker!({
         task: task.task,
         title: task.title,
         agent: task.agent,
@@ -3280,7 +3578,7 @@ export const register: Register = on => {
     const spawned: Worker[] = []
     for (let i = 0; i < n; i++) {
       const options = { ...e, task, title: `${String(e.title ?? clip(one(task), 32))} (${i + 1}/${n})` }
-      const result = await spawnWorker!($, options, {
+      const result = await spawnWorker!(options, {
         ...(models ? { model: models[i] } : {}),
         raceBatch: batch,
         onCreated: worker => spawned.push(worker),
@@ -3423,7 +3721,7 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_status' }, async $ => {
-    await loadAgentCatalog($)
+    await loadAgentCatalog()
     const led = await read($, ledgerAtom)
     if (!workers.size) return text(`no workers · session ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''}${agentWarnings.length ? `\n${agentWarnings.map(w => `⚠ ${w}`).join('\n')}` : ''}`)
     return text(
@@ -3484,7 +3782,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_btw' }, async ($, e) => {
     const w = workers.get(String(e.id ?? ''))
     if (w && orchestratorScopeError(w)) return text(orchestratorScopeError(w)!, true)
-    const result = await askBtw($, String(e.id ?? ''), e.question, e.timeoutSec, e.force)
+    const result = await askBtw(String(e.id ?? ''), e.question, e.timeoutSec, e.force)
     return text(result.message, result.error)
   })
 
@@ -3945,177 +4243,15 @@ export const register: Register = on => {
 
   const managerRequestSets = new Map<string, Set<string>>()
   const managerResponses = new Set<string>()
-  const managerResponse = async ($: any, manager: Worker, id: string, ok: boolean, message: string) => {
-    const key = `${manager.id}:${id}`
-    if (managerResponses.has(key)) return
-    managerResponses.add(key)
-    const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr/res`
-    const safeId = /^[\w.-]+$/.test(id) ? id : 'invalid'
-    const tmp = `${dir}/${safeId}.json.tmp`
-    const dest = `${dir}/${safeId}.json`
-    await $.fs.write(tmp, JSON.stringify({ id: safeId, ok, text: message })).catch(() => undefined)
-    await $.process.run(['mv', '-f', tmp, dest], { timeoutMs: 10_000 }).catch(() => undefined)
-  }
 
   const managerStatus = (manager: Worker) => {
     const children = childrenOf(manager)
     return children.length ? children.map(child => `[${child.id}] ${child.state}${child.warn.length ? ` ⚠ ${clip(one(child.warn[0]!), 100)}` : ''} — ${child.title}`).join('\n') : 'no sub-workers'
   }
 
-  const managerWait = async ($: any, manager: Worker, args: Record<string, unknown>) => {
-    if (manager.agent !== 'manager') return { ok: false, text: 'manager stopped' }
-    const allChildren = childrenOf(manager)
-    const ids = Array.isArray(args.ids) && args.ids.length ? (args.ids as unknown[]).map(String) : allChildren.filter(child => child.state === 'running' || child.state === 'queued' || child.reviewPending).map(child => child.id)
-    const invalid = ids.find(id => workers.get(id)?.parent !== manager.id)
-    if (invalid) return { ok: false, text: `${invalid} is not your sub-worker` }
-    const list = ids.map(id => workers.get(id)!).filter(Boolean)
-    if (!list.length) return { ok: true, text: 'nothing to wait for' }
-    const asked = Number(args.timeoutSec ?? 120)
-    const limitMs = Math.min(Math.max(Number.isFinite(asked) ? asked : 120, 1), 600) * 1000
-    const mode = args.mode === 'all' ? 'all' : 'first'
-    const watched = list.map(w => ({ w, wasQueued: w.state === 'queued', warningCount: w.warn.length }))
-    const changed = () => watched.filter(({ w, wasQueued, warningCount }) => firstWaitChanged(w.state, wasQueued, w.warn.length, warningCount, w.reviewPending)).map(({ w }) => w)
-    const done = () => list.filter(w => w.state !== 'running' && w.state !== 'queued' && !w.reviewPending)
-    const shouldReturn = () => manager.state !== 'running' || (mode === 'first' ? changed().length > 0 : done().length === list.length)
-    if (!shouldReturn()) await new Promise<void>(resolve => {
-      let timer: { cancel: () => void } | undefined
-      const cleanup = () => { waitListeners.delete(onChange); timer?.cancel() }
-      const complete = () => { cleanup(); resolve() }
-      const onChange = () => { if (shouldReturn()) complete() }
-      waitListeners.add(onChange)
-      timer = $.clock.after(limitMs, complete)
-      onChange()
-    })
-    if (manager.state !== 'running') return { ok: false, text: 'manager stopped' }
-    const selected = mode === 'first' ? changed() : list
-    const reports: string[] = []
-    for (const child of selected) {
-      if (child.state !== 'running' && child.state !== 'queued' && !child.reviewPending) {
-        child.isReported = true
-        reports.push(await digest(child))
-      } else reports.push(`[${child.id}] ${child.state} — ${child.last}${child.warn.length ? ` ⚠ ${child.warn.join('; ')}` : ''}`)
-    }
-    if (!reports.length) reports.push(`no sub-worker changed within ${Math.round(limitMs / 1000)}s`)
-    return { ok: true, text: reports.join('\n\n') }
-  }
 
-  const managerDiff = async ($: any, child: Worker, cap = 8000) => {
-    if (!child.worktree) return (await B?.nonGitDiff(child, cap)) ?? 'not ready'
-    const cwdW = workDir(child)
-    const stat = await B?.git(['diff', '--stat', 'HEAD'], cwdW)
-    const diff = await B?.git(['diff', 'HEAD'], cwdW)
-    const untracked = await B?.git(['ls-files', '--others', '--exclude-standard'], cwdW)
-    const fresh = (untracked?.stdout ?? '').split('\n').filter(file => file && !/__pycache__|\\.pyc$/.test(file))
-    const tracked = child.owns ? await B?.git(['diff', '--name-only', 'HEAD'], child.worktree) : undefined
-    const prefix = child.sub?.replace(/^\//, '')
-    const ownedFiles = [...(tracked?.stdout ?? '').split('\n').filter(Boolean), ...fresh.map(file => `${prefix ? `${prefix}/` : ''}${file}`)]
-    const outside = child.owns ? [...new Set(ownedFiles)].filter(file => !matchesAny(child.owns!, file)) : []
-    const ownershipWarning = outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}` : ''
-    const created: string[] = []
-    for (const file of fresh.slice(0, 8)) {
-      const item = await $.process.run(['git', 'diff', '--no-index', '--', '/dev/null', file], { cwd: cwdW, timeoutMs: 20_000 }).catch(() => undefined)
-      if (item?.stdout.trim()) created.push(clip(item.stdout.trimEnd(), 2500))
-    }
-    return clip([stat?.stdout.trim() || '(no tracked changes)', ownershipWarning, fresh.length ? `untracked (${fresh.length}):\n${fresh.join('\n')}` : '', clip(diff?.stdout ?? '', cap), ...created].filter(Boolean).join('\n\n'), cap)
-  }
 
-  const managerSend = async ($: any, manager: Worker, child: Worker, args: Record<string, unknown>) => {
-    const message = String(args.message ?? '').trim()
-    if (!message) return { ok: false, text: 'message is required' }
-    if (child.reviewPending) return { ok: false, text: `${child.id} is under review` }
-    const interrupt = args.interrupt === true
-    if (child.state === 'running' && !interrupt) return { ok: false, text: `${child.id} is still running; pass interrupt:true to redirect it` }
-    if (child.state === 'running') {
-      if (!child.send) return { ok: false, text: `${child.id} has no live process to interrupt` }
-      child.interrupting = true
-      await child.send({ type: 'abort' })
-      const settled = await new Promise<boolean>(resolve => {
-        const waiters = (child.settleWaiters ??= [])
-        let timer: { cancel: () => void } | undefined
-        const remove = () => { const at = waiters.indexOf(done); if (at >= 0) waiters.splice(at, 1); timer?.cancel() }
-        const done = () => { remove(); resolve(true) }
-        waiters.push(done)
-        timer = $.clock.after(15_000, () => { remove(); resolve(child.state !== 'running') })
-      })
-      child.interrupting = false
-      if (!settled || child.state === 'running') return { ok: false, text: `${child.id} did not settle within 15 seconds` }
-    }
-    if (!child.send && !child.session && !child.restored && !child.interruptedQueued) return { ok: false, text: `${child.id} has no live process or session to continue` }
-    if (!child.send && !canStart(child)) return { ok: false, text: 'no worker slot is available for this follow-up' }
-    child.texts = []
-    child.errors = []
-    B?.launch(child, message)
-    await sync()
-    return { ok: true, text: `sent to ${child.id}${child.send ? ' (same process, context kept)' : ' (resuming saved session)'}` }
-  }
 
-  const managerMerge = async ($: any, manager: Worker, child: Worker, args: Record<string, unknown>) => {
-    const run = mergeChain.then(async () => {
-      if (!child.worktree || !child.branch || !manager.worktree) return { ok: false, text: `${child.id} has no mergeable worktree` }
-      if (child.state === 'running' || child.state === 'queued' || child.reviewPending) return { ok: false, text: `${child.id} is still running or queued` }
-      const targetDir = manager.worktree!
-      const dirty = await B?.git(['status', '--porcelain', '--untracked-files=no'], targetDir)
-      if (dirty?.stdout.trim()) return { ok: false, text: `manager tree ${targetDir} has tracked changes; commit or stash them first` }
-      await B?.git(['add', '-A', '--', '.', ':(exclude,glob)**/__pycache__/**', ':(exclude,glob)**/*.pyc', ':(exclude,glob)**/.DS_Store'], child.worktree!)
-      const markers = await B?.git(['grep', '-n', '-E', '^(<<<<<<<|>>>>>>>) ', '--', '.'], child.worktree!)
-      if (markers?.exitCode === 0 && markers.stdout.trim()) return { ok: false, text: `${child.id} still has conflict markers: ${markers.stdout.trim().split('\n').slice(0, 4).join('; ')}` }
-      const merging = (await B?.git(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], child.worktree!))?.exitCode === 0
-      const staged = await B?.git(['diff', '--cached', '--quiet'], child.worktree!)
-      if (staged?.exitCode === 1 || merging) {
-        const committed = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'commit', '--allow-empty', '-m', `${child.title} (${child.id})`], child.worktree!)
-        if (committed?.exitCode !== 0) return { ok: false, text: `commit failed: ${committed?.stderr.trim() ?? 'unknown'}` }
-      }
-      const target = await B?.git(['rev-parse', 'HEAD'], targetDir)
-      if (target?.exitCode !== 0) return { ok: false, text: 'could not read manager integration branch HEAD' }
-      const sha = target!.stdout.trim()
-      const ancestor = await B?.git(['merge-base', '--is-ancestor', sha, child.branch!], targetDir)
-      if (ancestor?.exitCode !== 0) {
-        const rebase = await B?.git(['rebase', '--rebase-merges', sha], child.worktree!)
-        if (rebase?.exitCode !== 0) {
-          await B?.git(['rebase', '--abort'], child.worktree!)
-          return { ok: false, text: `refusing to merge ${child.id}: rebase onto manager HEAD failed.\n${clip(one(rebase?.stderr.trim() || rebase?.stdout.trim() || 'git rebase failed'), 1000)}` }
-        }
-      }
-      const ahead = await B?.git(['rev-list', '--count', `${sha}..${child.branch}`], targetDir)
-      if (Number(ahead?.stdout.trim() ?? 0) === 0) return { ok: true, text: `${child.id}: nothing to merge` }
-      const merged = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-ff', '-m', String(args.message ?? `sub merge ${child.id}: ${child.title}`), child.branch!], targetDir)
-      if (merged?.exitCode !== 0) {
-        const conflicts = await B?.git(['diff', '--name-only', '--diff-filter=U'], targetDir)
-        await B?.git(['merge', '--abort'], targetDir)
-        const head = (await B?.git(['rev-parse', 'HEAD'], targetDir))?.stdout.trim()
-        const stagedConflict = head ? await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'merge', '--no-commit', '--no-ff', head], child.worktree!) : undefined
-        const handed = stagedConflict && stagedConflict.exitCode !== 0 ? (await B?.git(['diff', '--name-only', '--diff-filter=U'], child.worktree!))?.stdout.trim() : undefined
-        return { ok: false, text: `merge conflict, aborted; manager branch is untouched. conflicting: ${conflicts?.stdout.trim().split('\n').join(', ') || merged?.stderr.trim()}.${handed ? ` The same conflict is now in ${child.id}'s worktree as <<<<<<< markers (${handed.split('\n').join(', ')}); use sub_send to resolve it, run checks, then sub_diff and sub_merge again.` : ''}` }
-      }
-      const mergeSha = (await B?.git(['rev-parse', 'HEAD'], targetDir))?.stdout.trim()
-      if (!mergeSha) return { ok: false, text: 'merge succeeded but could not read the merge commit' }
-      const toolbox = await loadTools($, manager.root, targetDir)
-      const required = Object.entries(toolbox.checks).filter(([, check]) => check.required).map(([name]) => name)
-      const tmp = `${agentDir}/tmp/${sid}-${manager.id}-${child.id}-merge-checks`
-      let failed: { name: string; exit: number; tail: string } | undefined
-      if (required.length) {
-        await $.process.run(['mkdir', '-p', tmp], { timeoutMs: 10_000 }).catch(() => undefined)
-        const lockKey = [...`${manager.root}${toolbox.sub}`].reduce((h, ch) => (Math.imul(h, 31) + ch.charCodeAt(0)) >>> 0, 7).toString(36)
-        const checks = Object.fromEntries(Object.entries(toolbox.checks).map(([name, check]) => [name, { ...check, lock: `${agentDir}/locks/${name}-${lockKey}.lock` }]))
-        const checksFile = `${tmp}/checks.json`
-        await $.fs.write(checksFile, JSON.stringify({ cwd: `${targetDir}${toolbox.sub}`, checks }, null, 2))
-        for (const name of required) {
-          const check = toolbox.checks[name]!
-          const result = await $.process.run(['bash', '-c', `check ${name}`], { cwd: `${targetDir}${toolbox.sub}`, env: { PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`, HOME: home, PI_CODING_AGENT_DIR: agentDir, PI_CHECKS_FILE: checksFile, PI_CHECKS_REQUIRED: required.join(','), TMPDIR: tmp, ...(apiKey ? { OPENCODE_GO_API_KEY: apiKey } : {}) }, timeoutMs: Math.min(3600, check.timeoutSec) * 1000 }).catch(() => undefined)
-          if (result?.exitCode !== 0) { failed = { name, exit: result?.exitCode ?? -1, tail: clip(`${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim().slice(-VERIFY_TAIL * 2), VERIFY_TAIL) }; break }
-        }
-        await $.process.run(['rm', '-rf', tmp], { timeoutMs: 10_000 }).catch(() => undefined)
-      }
-      if (failed) {
-        const reverted = await B?.git(['-c', 'user.name=omp-conductor', '-c', 'user.email=omp-conductor@localhost', 'revert', '--no-edit', '-m', '1', mergeSha], targetDir)
-        return { ok: false, text: `post-merge check ${failed.name} failed (exit ${failed.exit}); ${reverted?.exitCode === 0 ? 'merge reverted' : 'automatic revert failed; manager branch may need manual recovery'}.\n${failed.tail}` }
-      }
-      const stat = await B?.git(['diff', '--stat', `${sha}..${mergeSha}`], targetDir)
-      return { ok: true, text: `merged ${child.branch} into manager ${manager.id}${required.length ? `; required checks passed: ${required.join(', ')}` : ''}\n${stat?.stdout.trim() ?? ''}` }
-    })
-    mergeChain = run.then(() => undefined, () => undefined)
-    return await run
-  }
 
   const managerChild = (manager: Worker, args: Record<string, unknown>) => {
     const id = typeof args.id === 'string' ? args.id : ''
@@ -4124,145 +4260,8 @@ export const register: Register = on => {
     return error ? { error } : { child: child! }
   }
 
-  const managerOperation = async ($: any, manager: Worker, tool: string, args: Record<string, unknown>): Promise<{ ok: boolean; text: string }> => {
-    if (manager.agent !== 'manager' || manager.state !== 'running') return { ok: false, text: 'manager stopped' }
-    if (tool === 'sub_status') return { ok: true, text: managerStatus(manager) }
-    if (tool === 'sub_wait') return managerWait($, manager, args)
-    if (tool === 'sub_spawn') {
-      const task = String(args.task ?? '').trim()
-      if (!task) return { ok: false, text: 'task is required' }
-      const agent = String(args.agent ?? DEFAULT_AGENT)
-      if (agent === 'manager') return { ok: false, text: 'sub-workers cannot launch workers; only manager workers may spawn sub-workers' }
-      const result = await spawnWorker!($, { ...args, task, agent, dir: workDir(manager), worktree: true }, { caller: manager })
-      const answer = String(result?.result ?? result?.deny ?? '')
-      const childId = /\b(w\d+)\b/.exec(answer)?.[1]
-      return result?.deny || !childId ? { ok: false, text: answer || 'sub-worker spawn failed' } : { ok: true, text: childId }
-    }
-    const picked = managerChild(manager, args)
-    if (picked.error) return { ok: false, text: picked.error }
-    const child = picked.child!
-    if (tool === 'sub_digest') {
-      if (child.state !== 'running' && child.state !== 'queued' && !child.reviewPending) child.isReported = true
-      return { ok: true, text: await digest(child, args.detail === 'full') }
-    }
-    if (tool === 'sub_diff') return { ok: true, text: await managerDiff($, child, Math.min(Math.max(Number(args.maxChars ?? 8000), 500), 40000)) }
-    if (tool === 'sub_send') return managerSend($, manager, child, args)
-    if (tool === 'sub_merge') return managerMerge($, manager, child, args)
-    if (tool === 'sub_btw') {
-      const result = await askBtw($, child.id, args.question, args.timeoutSec, args.force, manager)
-      return { ok: !result.error, text: result.message }
-    }
-    if (tool === 'sub_log') {
-      const events = child.events ?? []
-      const total = child.eventTotal ?? events.length
-      const start = Math.max(0, total - events.length)
-      const requested = Number(args.count ?? 40)
-      const count = Math.min(Math.max(Number.isFinite(requested) ? Math.floor(requested) : 40, 1), 200)
-      const from = Math.max(start, args.from == null ? total - count : Math.floor(Number(args.from) || 0))
-      const page = events.map((line, index) => ({ index: start + index, line })).filter(item => item.index >= from).slice(0, count)
-      return { ok: true, text: [`[${child.id}] log: ${total} total events; retained window ${events.length ? `${start}..${total - 1}` : 'empty'}; page from ${from}`, ...page.map(item => `${item.index}: ${item.line}`)].join('\n') }
-    }
-    if (tool === 'sub_kill') {
-      if (child.state === 'queued') {
-        child.killed = true; child.state = 'killed'; child.endedAt = Date.now(); child.last = 'removed from the spawn queue'
-        scheduleQueue(); notifyWaiters(); void B?.finished(child)
-        return { ok: true, text: `removed queued sub-worker ${child.id}` }
-      }
-      if (child.state !== 'running') return { ok: true, text: `${child.id} is already ${child.state}` }
-      child.killed = true
-      void child.send?.({ type: 'abort' })
-      child.stop?.()
-      finish(child)
-      return { ok: true, text: `killed ${child.id}` }
-    }
-    if (tool === 'sub_cleanup') {
-      if (child.state === 'running' || child.reviewPending) return { ok: false, text: `${child.id} is still running or under review` }
-      if (child.worktree && child.branch) {
-        if (args.force !== true) {
-          const dirty = await B?.git(['status', '--porcelain'], child.worktree)
-          const ahead = await B?.git(['rev-list', '--count', `HEAD..${child.branch}`], child.dir)
-          if (dirty?.stdout.trim() || Number(ahead?.stdout.trim() ?? 0) > 0) return { ok: false, text: `${child.id} has unmerged work; sub_merge it first or pass force:true` }
-        }
-        const removed = await B?.git(['worktree', 'remove', '--force', child.worktree], child.dir)
-        if (removed?.exitCode !== 0) return { ok: false, text: `worktree remove failed: ${removed?.stderr.trim()}` }
-        await B?.git(['branch', '-D', child.branch], child.dir)
-      }
-      const leftovers = [workerTmpDir(agentDir, child, sid), child.snapDir, child.marker, child.btwDir, workerCommandFile(agentDir, child, sid)].filter((path): path is string => !!path)
-      await $.process.run(['rm', '-rf', ...leftovers], { timeoutMs: 15_000 }).catch(() => undefined)
-      manager.subCost = (manager.subCost ?? 0) + child.cost
-      manager.subTokensIn = (manager.subTokensIn ?? 0) + child.tokensIn
-      manager.subTokensOut = (manager.subTokensOut ?? 0) + child.tokensOut
-      manager.subTokensCache = (manager.subTokensCache ?? 0) + child.tokensCache
-      manager.subSteps = (manager.subSteps ?? 0) + child.steps
-      workers.delete(child.id)
-      scheduleQueue(); await sync()
-      return { ok: true, text: `cleaned up ${child.id}` }
-    }
-    return { ok: false, text: 'unknown tool' }
-  }
 
-  const scanManagerRequests = async ($: any) => {
-    const managers = [...workers.values()].filter(worker => worker.agent === 'manager' && worker.state === 'running')
-    for (const manager of managers) {
-      const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr/req`
-      const entries = (await $.fs.list(dir).catch(() => [])) as { name: string; kind?: string }[]
-      for (const entry of entries) {
-        if (!entry.name.endsWith('.json')) continue
-        const raw = await $.fs.read(`${dir}/${entry.name}`).catch(() => undefined)
-        await $.process.run(['rm', '-f', `${dir}/${entry.name}`], { timeoutMs: 5000 }).catch(() => undefined)
-        if (typeof raw !== 'string') continue
-        let parsed: unknown
-        try { parsed = JSON.parse(raw) } catch { parsed = undefined }
-        const request = validateManagerRequest(parsed)
-        const requestError = 'error' in request ? request.error : undefined
-        const validRequest = request as { id: string; tool: string; args: Record<string, unknown> }
-        const id = requestError ? entry.name.slice(0, -5) : validRequest.id
-        const seen = managerRequestSets.get(manager.id) ?? new Set<string>()
-        managerRequestSets.set(manager.id, seen)
-        if (seen.has(id)) continue
-        seen.add(id)
-        const active = managerInflight.get(manager.id) ?? new Set<string>()
-        managerInflight.set(manager.id, active)
-        active.add(id)
-        manager.lastAt = Date.now()
-        if (requestError) {
-          void managerResponse($, manager, id, false, requestError).finally(() => active.delete(id))
-          continue
-        }
-        void (async () => {
-          try {
-            const result = await managerOperation($, manager, validRequest.tool, validRequest.args)
-            if (manager.state !== 'running') await managerResponse($, manager, id, false, 'manager stopped')
-            else await managerResponse($, manager, id, result.ok, result.text)
-          } catch (error) {
-            await managerResponse($, manager, id, false, String((error as Error)?.message ?? error))
-          } finally {
-            active.delete(id)
-          }
-        })()
-      }
-    }
-  }
 
-  managerBridgeStop = manager => {
-    const api = sessionApi
-    const dir = `${agentDir}/run/${workerPathKey(manager, sid)}.mgr`
-    const active = managerInflight.get(manager.id) ?? new Set<string>()
-    for (const id of active) void managerResponse(api, manager, id, false, 'manager stopped')
-    void (async () => {
-      const entries = (await api.fs.list(`${dir}/req`).catch(() => [])) as { name: string }[]
-      for (const entry of entries) {
-        if (!entry.name.endsWith('.json')) continue
-        const file = `${dir}/req/${entry.name}`
-        const raw = await api.fs.read(file).catch(() => undefined)
-        await api.process.run(['rm', '-f', file], { timeoutMs: 5000 }).catch(() => undefined)
-        let id = entry.name.slice(0, -5)
-        try { const parsed = JSON.parse(String(raw ?? '')); if (typeof parsed?.id === 'string') id = parsed.id } catch { /* use the filename */ }
-        await managerResponse(api, manager, id, false, 'manager stopped')
-      }
-      notifyWaiters()
-    })()
-  }
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
