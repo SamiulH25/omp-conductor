@@ -106,7 +106,10 @@ const WORKER_SETTINGS = {
   defaultTools: ['read', 'edit', 'write', 'bash', 'grep'],
   quietStartup: true,
 }
-const WORKER_MODELS = {
+// Only the key: a `models` entry would replace Pi's catalog entry for that id, and with it the price Pi computes cost from.
+const WORKER_MODELS = { providers: { 'opencode-go': { apiKey: '$OPENCODE_GO_API_KEY' } } }
+// What older versions wrote. It shadowed the catalog's DeepSeek with an unpriced copy, so every turn reported $0.
+const LEGACY_WORKER_MODELS = {
   providers: {
     'opencode-go': {
       baseUrl: 'https://opencode.ai/zen/go/v1',
@@ -117,6 +120,13 @@ const WORKER_MODELS = {
       ],
     },
   },
+}
+const sameJson = (text: unknown, v: unknown) => {
+  try {
+    return typeof text === 'string' && JSON.stringify(JSON.parse(text)) === JSON.stringify(v)
+  } catch {
+    return false
+  }
 }
 const SETUP_HELP = `omp-conductor workers run on Pi, and Pi is not ready:
 {problems}
@@ -754,7 +764,8 @@ export const register: Register = on => {
         ['models.json', `${JSON.stringify(WORKER_MODELS, null, 2)}\n`],
       ] as const) {
         const path = `${agentDir}/${name}`
-        if (!(await $.fs.exists(path).catch(() => false))) await $.fs.write(path, body).catch(() => undefined)
+        const stale = name === 'models.json' && sameJson(await $.fs.read(path).catch(() => undefined), LEGACY_WORKER_MODELS)
+        if (stale || !(await $.fs.exists(path).catch(() => false))) await $.fs.write(path, body).catch(() => undefined)
       }
       apiKey = ''
       const envText = await $.fs.read(`${agentDir}/env`).catch(() => undefined)
