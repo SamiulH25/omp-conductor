@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Act, WorkerView } from '../types'
+import type { Act, WorkerView as WorkerViewBase } from '../types'
 
 const PANE = 'omp-conductor'
 const MAX_WORKERS = 4
@@ -217,12 +217,15 @@ const modelAtom = atom({ plugin: 'omp-conductor', key: 'model' } as const, 'open
 const thinkingAtom = atom({ plugin: 'omp-conductor', key: 'thinking' } as const, 'low')
 const ledgerAtom = atom({ plugin: 'omp-conductor', key: 'ledger' } as const, { cost: 0, tokens: 0, spawned: 0 })
 
-type State = 'running' | 'done' | 'failed' | 'killed'
+type State = 'running' | 'queued' | 'done' | 'failed' | 'killed'
+type WorkerView = Omit<WorkerViewBase, 'state'> & { state: State }
 
 type Worker = {
   id: string
   title: string
   task: string
+  after?: string[]
+  queuedReason?: string
   dir: string
   root: string // git toplevel, or dir outside git; keys the project dictionary
   isGit: boolean
@@ -512,7 +515,7 @@ export const register: Register = on => {
       state: w.state,
       startedAt: w.startedAt,
       endedAt: w.endedAt,
-      last: w.last,
+      last: w.state === 'queued' ? w.queuedReason ?? w.last : w.last,
       files: w.files.size,
       tokens: w.tokensIn + w.tokensOut,
       cost: w.cost,
@@ -535,6 +538,54 @@ export const register: Register = on => {
   const sync = () => B?.sync() ?? Promise.resolve()
 
   const workDir = (w: Worker) => (w.worktree ? `${w.worktree}${w.sub ?? ''}` : w.dir)
+
+  const dependencyPrompt = (w: Worker) => {
+    const results = (w.after ?? []).map(id => {
+      const upstream = workers.get(id)!
+      const detailed = upstream.agent === 'explore' || upstream.agent === 'review'
+      const report = detailed ? upstream.texts.at(-1) : ownSummary(upstream) ?? upstream.summary ?? upstream.texts.at(-1)
+      return `--- ${id} (${upstream.title}) ---\n${clip(report?.trim() || upstream.last, 3000)}`
+    })
+    return results.length
+      ? `Results from the workers you depend on:\n${results.join('\n\n')}\n\n--- Your task ---\n${w.task}`
+      : w.task
+  }
+
+  const scheduleQueue = () => {
+    if (!B) return
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const w of workers.values()) {
+        if (w.state !== 'queued') continue
+        const waitingOn = (w.after ?? []).filter(id => workers.get(id)?.state !== 'done')
+        w.queuedReason = waitingOn.length ? `waiting for dependencies: ${waitingOn.join(', ')}` : 'waiting for a worker slot'
+        const bad = (w.after ?? []).map(id => ({ id, upstream: workers.get(id) })).find(({ upstream }) =>
+          !upstream || (upstream.state !== 'done' && upstream.state !== 'running' && upstream.state !== 'queued'),
+        )
+        if (bad) {
+          const reason = `dependency ${bad.id} ${bad.upstream?.state ?? 'failed (cleaned up)'}`
+          w.state = 'failed'
+          w.runError = reason
+          w.errors.push(reason)
+          w.last = reason
+          w.endedAt = Date.now()
+          void B.finished(w)
+          changed = true
+        }
+      }
+      if (running() >= MAX_WORKERS) break
+      const next = [...workers.values()].find(
+        w => w.state === 'queued' && (w.after ?? []).every(id => workers.get(id)?.state === 'done'),
+      )
+      if (!next) break
+      next.queuedReason = undefined
+      next.startedAt = Date.now()
+      next.last = 'starting'
+      B.launch(next, dependencyPrompt(next))
+      changed = true
+    }
+  }
 
   // A run is over (Pi settled, the process died, it was killed or hit its time limit). The process may stay up.
   const finish = (w: Worker) => {
@@ -561,6 +612,7 @@ export const register: Register = on => {
     }
     w.endedAt = Date.now()
     w.state = next
+    scheduleQueue()
     void B?.finished(w)
   }
 
@@ -772,6 +824,8 @@ export const register: Register = on => {
     const lines: string[] = []
     const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
     lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}`)
+    if (w.state === 'queued') lines.push(`queue: ${w.queuedReason ?? 'waiting for a worker slot'}`)
+    if (w.after?.length) lines.push(`depends on: ${w.after.join(', ')}`)
     lines.push(`dir: ${workDir(w)}${w.worktree ? ' (worktree)' : ''}`)
     const files = [...w.files]
     if (files.length) {
@@ -809,15 +863,17 @@ export const register: Register = on => {
     const final = w.texts.at(-1)?.trim()
     const own = ownSummary(w)
     // Mid-run the last message is usually an opening line from many steps ago: show the live activity instead.
-    if (w.state === 'running') {
+    if (w.state === 'queued') {
+      lines.push(`not started yet: ${w.queuedReason ?? 'waiting for a worker slot'}`)
+    } else if (w.state === 'running') {
       lines.push(`now: ${w.last} (no final message yet)`)
-    } else if (kind.report === 'detailed' && final && w.state !== 'running') {
+    } else if (kind.report === 'detailed' && final) {
       // Explore and review agents: the whole report, never compressed.
       const cap = full ? REPORT_CHARS_FULL : REPORT_CHARS
       lines.push(`report${final.length > cap ? ` (first ${cap} of ${final.length} chars; detail:"full" for more)` : ''}:`, clip(final, cap))
     } else if (own) {
       lines.push(`summary (worker's own): ${clip(own, 800)}`)
-    } else if (final && w.state !== 'running' && final.length > FINAL_CHARS && !full) {
+    } else if (final && final.length > FINAL_CHARS && !full) {
       w.summary ??= await B?.summarize(final)
       lines.push(
         w.summary ? `summary (haiku): ${w.summary}` : `final: ${clip(final, FINAL_CHARS)}`,
@@ -994,7 +1050,9 @@ export const register: Register = on => {
     const record = (w: Worker) => ({
       id: w.id,
       title: w.title,
-      task: clip(w.task, 500),
+      task: clip(w.task, w.state === 'queued' ? REPORT_CHARS_FULL : 500),
+      after: w.after,
+      queuedReason: w.queuedReason,
       dir: w.dir,
       root: w.root,
       isGit: w.isGit,
@@ -1140,7 +1198,7 @@ export const register: Register = on => {
         $.ui.status(
           all.length === 0 && !led.spawned
             ? undefined
-            : `pi ${n('running')} running · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
+            : `pi ${n('running')} running · ${n('queued')} queued · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
         )
       },
 
@@ -1467,10 +1525,11 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_spawn',
       description:
-        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once; if all worker slots are occupied or its after dependencies are unfinished, it queues FIFO and pi_spawn reports its position. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
+           after: { type: 'array', items: { type: 'string' }, description: 'Worker ids this task depends on. It waits until every worker finishes successfully; their reports are prepended to this task. Unknown ids are rejected.' },
           dir: { type: 'string', description: 'Working directory (default: session cwd)' },
           title: { type: 'string', description: 'Short label' },
           agent: {
@@ -1563,7 +1622,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_wait',
       description:
-        'Wait until the given workers (default: all running) finish or timeoutSec passes (max 90 per call; call again to keep waiting), then return their digests.',
+        'Wait until the given workers (default: all running or queued) finish or timeoutSec passes (max 90 per call; call again to keep waiting), then return their digests.',
       inputSchema: obj({
         ids: { type: 'array', items: { type: 'string' } },
         timeoutSec: { type: 'number' },
@@ -1586,7 +1645,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_send',
       description:
-        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes and for the next task in the same area instead of re-spawning (no re-reading, no re-learning the layout). Send only the new instruction; it already has the background. The worker must not be running.',
+        'Send a follow-up message to a finished worker. Its Pi process (or, after 30 idle minutes, its saved session) keeps everything it already read, so use this for fixes and for the next task in the same area instead of re-spawning (no re-reading, no re-learning the layout). Send only the new instruction; it already has the background. The worker must not be running. Follow-ups are refused rather than queued when all worker slots are occupied.',
       inputSchema: obj(
         {
           ...idProp,
@@ -1605,7 +1664,7 @@ export const register: Register = on => {
     })
     await $.tool.register({
       name: 'pi_kill',
-      description: 'Abort a running worker and stop its Pi process.',
+      description: 'Abort a running worker and stop its Pi process, or remove a queued worker from the spawn queue.',
       inputSchema: obj(idProp, ['id']),
     })
 
@@ -1618,7 +1677,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_cleanup',
       description:
-        "Remove a finished worker's worktree and branch and forget the worker. Refuses if it has unmerged work unless force is true.",
+        "Remove a finished or queued worker's worktree and branch and forget the worker. Refuses if it has unmerged work unless force is true.",
       inputSchema: obj({ ...idProp, force: { type: 'boolean' } }, ['id']),
     })
 
@@ -1629,7 +1688,9 @@ export const register: Register = on => {
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
     await $.command.register({ name: 'pi-setup', description: 'Install guide for omp-conductor and Pi, with a check of what this machine still needs' })
 
+    scheduleQueue()
     $.clock.every(1000, () => {
+      scheduleQueue()
       if (running() > 0) void sync()
       // An idle worker's process is stopped after a while; pi_send resumes its saved session.
       for (const w of workers.values()) {
@@ -1818,9 +1879,10 @@ export const register: Register = on => {
     if (notReady) return text(notReady, true)
     const task = String(e.task ?? '').trim()
     if (!task) return text('task is required', true)
-    if (running() >= MAX_WORKERS) {
-      return text(`max ${MAX_WORKERS} concurrent workers; wait for one to finish first`, true)
-    }
+    if (e.after !== undefined && !Array.isArray(e.after)) return text('after must be an array of worker ids', true)
+    const after = [...new Set((Array.isArray(e.after) ? e.after : []).map(String))]
+    const missing = after.filter(id => !workers.has(id))
+    if (missing.length) return text(`unknown dependency worker id(s): ${missing.join(', ')}`, true)
     const agent = String(e.agent ?? DEFAULT_AGENT)
     const kind = AGENTS[agent]
     if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
@@ -1908,6 +1970,10 @@ export const register: Register = on => {
       id,
       title: String(e.title ?? clip(one(task), 40)),
       task,
+      after: after.length ? after : undefined,
+      queuedReason: after.some(dep => workers.get(dep)?.state !== 'done')
+        ? `waiting for dependencies: ${after.filter(dep => workers.get(dep)?.state !== 'done').join(', ')}`
+        : 'waiting for a worker slot',
       dir,
       root: isGit ? top!.stdout.trim() : dir,
       isGit,
@@ -1918,7 +1984,7 @@ export const register: Register = on => {
       codex: codex || undefined,
       skills: skills.length ? skills : undefined,
       agent,
-      state: 'running',
+      state: 'queued',
       startedAt: Date.now(),
       files: new Set(),
       reads: new Set(),
@@ -1960,11 +2026,17 @@ export const register: Register = on => {
     }
     workers.set(id, w)
     void B?.ledger(0, 0, 1)
-    B?.launch(w, task)
+    scheduleQueue()
     await sync()
     const seeded = Object.keys(((await $.store.get(DICT_PREFIX + w.root).catch(() => undefined)) as object | undefined) ?? {}).length > 0
+    const position = [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === id) + 1
+    const outcome = w.state === 'running'
+      ? `started ${id} [${agent}] "${w.title}" in ${workDir(w)}`
+      : w.state === 'queued'
+        ? `queued ${id} at position ${position} (${w.queuedReason})`
+        : `created ${id}, but it failed: ${w.runError ?? w.state}`
     return text(
-      `started ${id} [${agent}] "${w.title}" in ${workDir(w)}` +
+      `${outcome}` +
         (skills.length ? `\nskills: ${skills.map(s => s.name).join(', ')}` : '') +
         (checks.length ? `\nrequired checks (the worker runs them itself): ${checks.join(', ')}${tools.source === 'unity default' ? ' (built-in Unity toolbox)' : ''}` : '') +
         (seeded ? '' : `\nNo project dictionary for ${w.root} yet. Seed one with pi_dict (set) before the next spawn so workers stop re-learning the project.`),
@@ -2083,7 +2155,8 @@ export const register: Register = on => {
       [...workers.values()]
         .map(w => {
           const r = (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps
-          return `[${w.id}] ${w.state} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length}` : ''} — ${w.title} — ${w.last}`
+          const position = w.state === 'queued' ? [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === w.id) + 1 : 0
+          return `[${w.id}] ${w.state}${position ? ` (position ${position})` : ''} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length}` : ''} — ${w.title} — ${w.last}`
         })
         .concat(`session total ${money(led.cost)} · ${led.spawned} spawned`)
         .join('\n'),
@@ -2093,7 +2166,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_digest' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
-    if (w.state !== 'running') w.isReported = true
+    if (w.state !== 'running' && w.state !== 'queued') w.isReported = true
     return text(await digest(w, e.detail === 'full'))
   })
 
@@ -2105,14 +2178,14 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_wait' }, async ($, e, next) => {
     const ids = Array.isArray(e.ids) && e.ids.length
       ? (e.ids as string[])
-      : [...workers.values()].filter(w => w.state === 'running').map(w => w.id)
+      : [...workers.values()].filter(w => w.state === 'running' || w.state === 'queued').map(w => w.id)
     const list = ids.map(i => workers.get(i)).filter((w): w is Worker => !!w)
     if (!list.length) return text('nothing to wait for')
     const limitMs = Math.min(Math.max(Number(e.timeoutSec ?? 60), 1), 90) * 1000
     const start = Date.now()
     const any = e.mode === 'any'
     for (;;) {
-      const done = list.filter(w => w.state !== 'running')
+      const done = list.filter(w => w.state !== 'running' && w.state !== 'queued')
       if (any ? done.length > 0 : done.length === list.length) break
       if (Date.now() - start >= limitMs) break
       // $.clock.sleep would spend the hook's 10 s budget; a $ call in flight does not.
@@ -2121,9 +2194,14 @@ export const register: Register = on => {
     }
     const parts: string[] = []
     for (const w of list) {
-      if (w.state !== 'running') {
+      if (w.state !== 'running' && w.state !== 'queued') {
         w.isReported = true
         parts.push(await digest(w))
+        continue
+      }
+      if (w.state === 'queued') {
+        const position = [...workers.values()].filter(x => x.state === 'queued').findIndex(x => x.id === w.id) + 1
+        parts.push(`[${w.id}] queued at position ${position}; ${w.queuedReason ?? 'waiting for a worker slot'}`)
         continue
       }
       // Still running: one line of what changed since the last wait, never the whole digest again.
@@ -2136,8 +2214,8 @@ export const register: Register = on => {
       w.waitSteps = w.steps
       w.waitFiles = w.files.size
     }
-    const still = list.filter(w => w.state === 'running').length
-    if (still) parts.push(`(${still} still running; call pi_wait again)`)
+    const still = list.filter(w => w.state === 'running' || w.state === 'queued').length
+    if (still) parts.push(`(${still} still running or queued; call pi_wait again)`)
     return text(parts.join('\n\n'))
   })
 
@@ -2148,7 +2226,7 @@ export const register: Register = on => {
     if (!w.send && !w.session) return text(`${w.id} has no live process or session id to continue`, true)
     const notReady = await ensureSetup()
     if (notReady) return text(notReady, true)
-    if (running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers`, true)
+    if (running() >= MAX_WORKERS) return text(`max ${MAX_WORKERS} concurrent workers; pi_send follow-ups are not queued (they resume an existing session), so wait for a slot and try again`, true)
     const message = String(e.message ?? '').trim()
     if (!message) return text('message is required', true)
     if (typeof e.maxMinutes === 'number' && e.maxMinutes > 0) w.maxMinutes = Math.min(e.maxMinutes, 240)
@@ -2209,6 +2287,15 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_kill' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
+    if (w.state === 'queued') {
+      w.killed = true
+      w.state = 'killed'
+      w.endedAt = Date.now()
+      w.last = 'removed from the spawn queue'
+      scheduleQueue()
+      void B?.finished(w)
+      return text(`removed queued worker ${w.id}`)
+    }
     if (w.state !== 'running') return text(`${w.id} is already ${w.state}`)
     w.killed = true
     void w.send?.({ type: 'abort' })
@@ -2220,6 +2307,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'mcp__omp-conductor__pi_merge' }, async (_$, e) => {
     const w = pick(e)
     if (!w) return text(`no worker ${String(e.id)}`, true)
+    if (w.state === 'queued') return text(`${w.id} is queued and has no work to merge yet`, true)
     if (w.state === 'running') return text(`${w.id} is still running`, true)
     if (!w.worktree || !w.branch) return text(`${w.id} has no worktree to merge`, true)
     if (!B) return text('not ready', true)
@@ -2279,6 +2367,14 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     if (w.state === 'running') return text(`${w.id} is still running; pi_kill it first`, true)
     if (!B) return text('not ready', true)
+    if (w.state === 'queued') {
+      w.killed = true
+      w.state = 'killed'
+      w.endedAt = Date.now()
+      w.last = 'removed from spawn queue for cleanup'
+      scheduleQueue()
+      void B.finished(w)
+    }
     if (w.worktree && w.branch) {
       if (e.force !== true) {
         const dirty = await B.git(['status', '--porcelain'], w.worktree)
@@ -2294,6 +2390,7 @@ export const register: Register = on => {
     w.stop?.()
     await $.process.run(['rm', '-rf', `${agentDir}/tmp/${sid}-${w.id}`, `${agentDir}/snap/${sid}-${w.id}`, `${agentDir}/run/${sid}-${w.id}.marker`, `${agentDir}/run/${sid}-${w.id}.btw`], { timeoutMs: 15_000 }).catch(() => undefined)
     workers.delete(w.id)
+    scheduleQueue()
     await sync()
     return text(`cleaned up ${w.id}`)
   })
@@ -2334,7 +2431,7 @@ export const register: Register = on => {
     }
     const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
-    const BORDER = { running: '', done: '#50fa7b', failed: '#ff5555', killed: '#6272a4' } as const
+    const BORDER = { running: '', queued: '#ffb86c', done: '#50fa7b', failed: '#ff5555', killed: '#6272a4' } as const
     // The face: finished states first, then a one-shot reaction, then idle, then a pose for what the agent is doing.
     const IDLE_MS = 10_000
     const faceOf = (w: { state: string; act?: string; lastAt?: number; react?: { kind: keyof typeof REACT_MS; at: number } }, f: number) => {
@@ -2382,6 +2479,7 @@ export const register: Register = on => {
 
     const bar = (w: { state: string }, f: number) => {
       const W = 12
+      if (w.state === 'queued') return '▱'.repeat(W)
       if (w.state === 'done') return '▰'.repeat(W)
       if (w.state === 'failed') return '▰'.repeat(W - 4) + '▱'.repeat(4)
       if (w.state === 'killed') return '▱'.repeat(W)
@@ -2392,13 +2490,15 @@ export const register: Register = on => {
     }
 
     const running = list.filter(w => w.state === 'running').length
+    const queued = list.filter(w => w.state === 'queued').length
     const done = list.filter(w => w.state === 'done').length
     const failed = list.filter(w => w.state === 'failed').length
     const tokens = list.reduce((n, w) => n + w.tokens, 0)
     const liveTps = Math.round(list.reduce((n, w) => n + (w.state === 'running' ? (rateOf(w)?.v ?? 0) : 0), 0))
 
+    const rank = (state: State) => state === 'running' ? 0 : state === 'queued' ? 1 : 2
     const sorted = [...list].sort((a, b) =>
-      a.state === 'running' !== (b.state === 'running') ? (a.state === 'running' ? -1 : 1) : b.startedAt - a.startedAt,
+      rank(a.state) - rank(b.state) || (a.state === 'queued' && b.state === 'queued' ? a.startedAt - b.startedAt : b.startedAt - a.startedAt),
     )
     const fit = Math.max(1, Math.floor((rows - 6) / 5))
     const shown = sorted.slice(0, fit)
@@ -2431,7 +2531,7 @@ export const register: Register = on => {
       const accent = BORDER[w.state] || sp.color
       const elapsedMs = (w.endedAt ?? now) - w.startedAt
       const spin = SPIN[f % SPIN.length]!
-      const badge =
+      const badge = w.state === 'queued' ? '⌛ queued' :
         w.state === 'running'
           ? `${spin} ${mmss(elapsedMs)}`
           : w.state === 'done'
@@ -2439,7 +2539,7 @@ export const register: Register = on => {
             : w.state === 'failed'
               ? `✖ failed ${mmss(elapsedMs)}`
               : `■ stopped ${mmss(elapsedMs)}`
-      const badgeColor = w.state === 'running' ? sp.color : w.state === 'done' ? '#50fa7b' : w.state === 'failed' ? '#ff5555' : '#6272a4'
+      const badgeColor = w.state === 'running' ? sp.color : w.state === 'queued' ? '#ffb86c' : w.state === 'done' ? '#50fa7b' : w.state === 'failed' ? '#ff5555' : '#6272a4'
       // A silent stretch (the model is between tokens, or a tool is running) ticks up so the card never looks frozen.
       const quiet = w.state === 'running' && w.lastAt && now - w.lastAt > 3000 ? `  · quiet ${Math.round((now - w.lastAt) / 1000)}s` : ''
       const activity =
@@ -2490,13 +2590,13 @@ export const register: Register = on => {
         <Box justifyContent="space-between">
           <Text bold color="#bd93f9">◆ conductor</Text>
           <Text dimColor>
-            {running} running · {done} done{failed ? ` · ${failed} failed` : ''}{liveTps ? ` · ⚡ ${liveTps} tok/s` : ''} · {money(ledger.cost)}
+            {running} running · {queued} queued · {done} done{failed ? ` · ${failed} failed` : ''}{liveTps ? ` · ⚡ ${liveTps} tok/s` : ''} · {money(ledger.cost)}
           </Text>
         </Box>
         <Text dimColor>{rule}</Text>
         {list.length === 0 && (
           <Box gap={2} marginTop={1}>
-            <Avatar w={{ id: 'w0', state: 'killed', title: '', startedAt: 0, last: '', files: 0, tokens: 0, errors: 0 }} f={frame} />
+            <Avatar w={{ id: 'w0', state: 'killed', title: '', startedAt: 0, last: '', files: 0, tokens: 0, cost: 0, errors: 0 }} f={frame} />
             <Box flexDirection="column">
               <Text bold>No workers yet</Text>
               <Text dimColor>Ask Claude to pi_spawn some and they will show up here.</Text>
