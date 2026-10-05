@@ -589,6 +589,7 @@ type Worker = {
   id: string
   parent?: string
   maxSubWorkers?: number
+  noDict?: boolean
   subCost?: number
   subTokensIn?: number
   subTokensOut?: number
@@ -2755,7 +2756,7 @@ export const register: Register = on => {
           .catch(() => undefined)
         const isGit = top?.exitCode === 0
         // Without a dictionary every dev worker re-discovers the same layout (and the same traps). Make the supervisor seed one.
-        if (kind.tools?.includes('edit') !== false && e.noDict !== true) {
+        if (kind.tools?.includes('edit') !== false && e.noDict !== true && !caller?.noDict) {
           const have = Object.keys(((await $.store.get(DICT_PREFIX + (caller?.root ?? (isGit ? top!.stdout.trim() : dir))).catch(() => undefined)) as object | undefined) ?? {}).length
           if (!have) {
             return text(`No project dictionary for ${isGit ? top!.stdout.trim() : dir} yet. Workers re-learn the layout every time without one. Seed it first with pi_dict (set): the main folders and what lives where, conventions, what workers must not touch. Put the checks workers should run themselves (tests, compile) in pi_tools, not the dictionary. Then spawn again. (Pass noDict:true to skip, e.g. for a throwaway task.)`, true)
@@ -2842,6 +2843,7 @@ export const register: Register = on => {
           id,
           parent: caller?.id,
           maxSubWorkers: agent === 'manager' ? (typeof e.maxSubWorkers === 'number' ? e.maxSubWorkers : 3) : undefined,
+      noDict: e.noDict === true || caller?.noDict === true ? true : undefined, // a manager started without a dictionary lets its sub-workers skip it too
           title: String(e.title ?? clip(one(task), 40)),
           task,
           sessionId: sid,
@@ -3803,24 +3805,15 @@ export const register: Register = on => {
     const done = () => list.filter(w => w.state !== 'running' && w.state !== 'queued' && !w.reviewPending)
     const shouldReturn = () => mode === 'first' ? changed().length > 0 : mode === 'any' ? done().length > 0 : done().length === list.length
     if (!shouldReturn()) {
+      // The timeout and the dispatch abort both end the wait through $.clock.sleep; the module sandbox has no AbortSignal.addEventListener.
+      let listener: (() => void) | undefined
       await new Promise<void>(resolve => {
-        let timer: { cancel: () => void } | undefined
-        const cleanup = () => {
-          waitListeners.delete(onChange)
-          timer?.cancel()
-          next.signal.removeEventListener('abort', complete)
-        }
-        const complete = () => {
-          cleanup()
-          resolve()
-        }
-        const onChange = () => { if (shouldReturn()) complete() }
-        waitListeners.add(onChange)
-        timer = $.clock.after(limitMs, complete)
-        next.signal.addEventListener('abort', complete, { once: true })
-        if (next.signal.aborted) complete()
-        else onChange()
+        listener = () => { if (shouldReturn()) resolve() }
+        waitListeners.add(listener)
+        void $.clock.sleep(limitMs, { signal: next.signal }).then(() => resolve(), () => resolve())
+        listener()
       })
+      if (listener) waitListeners.delete(listener)
     }
     const changedWorkers = changed()
     const selected = mode === 'first' && changedWorkers.length ? changedWorkers : list
