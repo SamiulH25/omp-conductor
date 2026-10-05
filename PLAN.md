@@ -69,3 +69,36 @@ When a worker has had no progress for N minutes (no new files, same tool repeate
 
 ## Order
 Phase 1 first (smallest, directly fixes the "why is it slow" problem). Then the spawn queue, per-type models and budgets from Phase 2, since they are small and cut cost. Persistence (item 9) is the largest change and goes after those. Each phase gets a plugin version bump and README/skill updates.
+
+## Phase 6: manager workers (sub-orchestrators)
+
+### Problem
+The orchestrator hands a worker a whole feature and the worker grinds on it for too long. Fix: each feature goes to a **manager** worker that breaks it down and launches its own sub-workers, acting as a sub-orchestrator. The manager reports back to the main orchestrator for approval.
+
+### Rules
+- The main orchestrator talks only to its **direct children**: managers, and any plain workers it launched itself. It never addresses a manager's sub-workers.
+- Only a `manager` can launch sub-workers. Plain workers (dev/general/explore/review/planner/custom) cannot, and a sub-worker can never be a manager (depth is exactly 2).
+- A manager finishes -> state `done` with a report; the orchestrator reviews it (`pi_digest`, `pi_diff`) and approves with `pi_merge`, or sends corrections with `pi_send` (the manager keeps its context and its sub-workers).
+
+### Shape
+- `pi_spawn { agent: "manager", task: <feature>, maxSubWorkers?, maxCost?, ... }`. Built-in agent type `manager`: tools `read, grep, find, ls, bash` (no edit/write: it must delegate, not implement) plus the manager tools below. Own worktree + branch like a dev worker; it is the **integration branch** for the feature. Default `maxMinutes` 60, `effort` from the usual settings.
+- Sub-workers are created from the manager's worktree HEAD, each in its own worktree/branch, so the manager merges them into its branch (`sub_merge`) and runs `check` there. The orchestrator then `pi_merge`s the manager's branch into main exactly as for any worker.
+- Slots: running non-manager workers (top-level or sub) count against `MAX_WORKERS` (4) globally; managers do not (they mostly wait), but at most 4 managers run at once. A manager may have at most `maxSubWorkers` (default 3) running at a time; more are queued by the normal queue.
+- Cost: a sub-worker's cost rolls up into its manager's cost, and the manager's `maxCost` / the session cap cover the whole subtree. Killing or cleaning up a manager cascades to its sub-workers.
+- Visibility: `pi_status`/pane/`pi_wait` list managers and the orchestrator's own workers; sub-workers appear indented under their manager in `pi_status` (and nested in the pane) but are never targets for orchestrator tools (they are refused with "w7 belongs to manager w3; talk to w3"). A manager's digest includes a rollup of its sub-workers (state, files, cost, warnings) and its own final report. `pi_wait` wakes on direct children only (plus a manager's ⚠ when one of its sub-workers fails or is stuck).
+- Stuck detection ignores a manager while it is blocked inside `sub_wait`.
+
+### Manager tools (a Pi extension, `extensions/manager.ts`, loaded only into managers)
+Registered with Pi's tool API; each tool call is a request over a file bridge to the plugin, which executes it with the **same internal functions** as the orchestrator tools, restricted to that manager's children:
+`sub_spawn {task, agent?, title?, owns?, after?, maxMinutes?, effort?, skills?, checks?, verify?, codex?}` (agent is one of dev|general|explore|review|planner or custom, never manager; returns the id), `sub_wait {ids?, timeoutSec?(default 120, max 600), mode?: first|all}` (event-driven like `pi_wait`, returns digests of what changed), `sub_status {}`, `sub_digest {id, detail?}`, `sub_diff {id}`, `sub_send {id, message, interrupt?}`, `sub_merge {id, message?}` (merges the sub-worker branch into the manager's branch), `sub_cleanup {id, force?}`, `sub_kill {id}`, `sub_log {id, from?, count?}`, `sub_btw {id, question?}`.
+
+### Bridge contract (exact)
+- Env `PI_MGR_DIR` = absolute per-manager dir with subdirs `req/` and `res/` (plugin creates both; `${agentDir}/run/<stableKey>.mgr`).
+- Tool call -> extension writes `req/<reqId>.json.tmp`, renames to `req/<reqId>.json`: `{"id": reqId, "tool": "sub_spawn", "args": {...}}`, then polls `res/<reqId>.json` every 300 ms until the tool's timeout (default 660 s; `sub_wait` uses its own timeoutSec + 30 s) and returns its `text` to the model; `ok:false` becomes a tool error.
+- Plugin scans `req/` of every running manager about every 500 ms (only while a manager runs), handles each request once, writes `res/<reqId>.json.tmp` -> `res/<reqId>.json`: `{"id": reqId, "ok": boolean, "text": string}`, and deletes the request file. Requests from a non-manager or for a worker that is not the caller's child are answered `ok:false`. Handlers must never throw; unknown tools get `ok:false`.
+- If the manager is aborted/killed, pending `sub_wait` requests are answered `ok:false, text: "manager stopped"`.
+
+### Work split
+1. **Plugin side** (`hooks/register.tsx`): `manager` agent type, `parent`/`children` on workers (persisted in the registry), bridge scanner + handlers refactored to share code with the pi_* tools, slot/cost/budget accounting, visibility rules, cascades, `/pi-status` tree, manager worktree-as-base for sub-workers, `maxSubWorkers`, manager role prompt.
+2. **Pi side** (`extensions/manager.ts` + `tests/manager-smoke.mjs`): the extension and a smoke test against a real `pi --mode rpc` with a fake plugin responder.
+3. Docs/skill (orchestrator): README + `orchestrate-pi` skill describing manager mode.
