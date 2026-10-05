@@ -206,6 +206,13 @@ const AGENTS: Record<string, AgentType> = {
   },
 }
 const DEFAULT_AGENT = 'general'
+const AGENT_TYPES = ['general', 'dev', 'explore', 'review'] as const
+type ModelAgentType = (typeof AGENT_TYPES)[number]
+type ModelOverrides = Partial<Record<ModelAgentType, string>>
+const resolveWorkerModel = (agent: string, codex: boolean, codexModel: string, overrides: ModelOverrides, globalModel: string, pinnedCodexModel?: string) =>
+  codex ? pinnedCodexModel ?? codexModel : overrides[agent as ModelAgentType] ?? globalModel
+const budgetThreshold = (cost: number, cap?: number): 'none' | 'warning' | 'exceeded' =>
+  !cap || cap <= 0 || cost <= 0 ? 'none' : cost >= cap ? 'exceeded' : cost >= cap * 0.8 ? 'warning' : 'none'
 const REPORT_CHARS = 60000 // a detailed report is shown whole; this is only a runaway guard (~15k tokens)
 const REPORT_CHARS_FULL = 200000 // ... with detail:"full", and the most the store keeps
 
@@ -293,6 +300,9 @@ type Worker = {
   genMs: number
   spark: number[]
   maxMinutes?: number
+  maxCost?: number
+  budgetWarned?: boolean
+  sessionBudgetWarned?: boolean
   cost: number
   sawEnd: boolean
   turnChars: number
@@ -317,7 +327,7 @@ type Bridge = {
   realPath: (dir: string) => Promise<string | undefined>
   wake: (id: string) => void
   flush: () => void
-  ledger: (cost: number, tokens: number, spawned: number) => Promise<void>
+  ledger: (cost: number, tokens: number, spawned: number, worker?: Worker) => Promise<void>
 }
 
 type Species = { color: string; rows: (eyes: string, mouth: string) => string[] }
@@ -491,6 +501,9 @@ export const register: Register = on => {
   let turnActive = false
   let demoOn = false
   let currentModel = DEFAULT_MODEL
+  let modelOverrides: ModelOverrides = {}
+  let sessionBudget: number | undefined
+  let sessionBudgetWarned = false
   let currentThinking = DEFAULT_THINKING
   let codexModel = CODEX_MODEL
   let codexThinking = CODEX_THINKING
@@ -727,7 +740,7 @@ export const register: Register = on => {
         w.tokensOut += gen
         const cost = Number(u.cost?.total ?? 0)
         w.cost += cost
-        void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0)
+        void B?.ledger(cost, Number(u.input ?? 0) + Number(u.cacheRead ?? 0) + Number(u.cacheWrite ?? 0) + gen, 0, w)
         // Exact decode speed for the turn: generated tokens over time after the first token.
         const decodeMs = m.duration != null ? Number(m.duration) - Number(m.ttft ?? 0) : w.firstAt ? Date.now() - w.firstAt : 0
         if (gen > 0 && decodeMs >= 150) {
@@ -801,7 +814,7 @@ export const register: Register = on => {
     }
     if (w.state !== 'running' && w.stderr.trim()) lines.push(`stderr: ${clip(one(w.stderr), 300)}`)
     const avg = w.genMs > 0 ? `, ~${Math.round(w.outTokens / (w.genMs / 1000))} tok/s` : ''
-    lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
+    lines.push(`steps ${w.steps}, tokens in ${w.tokensIn} (cached ${w.tokensCache}) / out ${w.tokensOut}${avg}, cost ${money(w.cost)}${w.maxCost ? ` / ${money(w.maxCost)} worker budget` : ''}${w.cost <= 0 ? ' (flat-rate plan, no per-token price)' : ''}`)
     for (const x of w.warn) lines.push(`⚠ ${x}`)
     if (w.checkRuns?.length) lines.push(`checks run: ${w.checkRuns.map(c => `${c.name} ${c.ok ? 'PASS' : `FAIL(${c.exit})`} ${c.secs}s`).join(', ')}`)
     else if (w.checks?.length && w.state !== 'running') lines.push(`checks run: none (required: ${w.checks.join(', ')})`)
@@ -982,6 +995,11 @@ export const register: Register = on => {
 
     currentModel = String((await $.store.get('model').catch(() => undefined)) || DEFAULT_MODEL)
     await update($, modelAtom, () => currentModel)
+    const savedOverrides = (await $.store.get('modelOverrides').catch(() => undefined)) as ModelOverrides | undefined
+    modelOverrides = Object.fromEntries(AGENT_TYPES.filter(type => typeof savedOverrides?.[type] === 'string').map(type => [type, savedOverrides![type]])) as ModelOverrides
+    const savedBudget = await $.store.get('budget').catch(() => undefined)
+    sessionBudget = typeof savedBudget === 'number' && Number.isFinite(savedBudget) && savedBudget > 0 ? savedBudget : undefined
+    sessionBudgetWarned = false
     const savedThinking = String((await $.store.get('thinking').catch(() => undefined)) || DEFAULT_THINKING)
     currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
     await update($, thinkingAtom, () => currentThinking)
@@ -1035,6 +1053,7 @@ export const register: Register = on => {
       genMs: w.genMs,
       spark: w.spark,
       maxMinutes: w.maxMinutes,
+      maxCost: w.maxCost,
       cost: w.cost,
     })
 
@@ -1116,12 +1135,54 @@ export const register: Register = on => {
         return r.isAnswered ? r.text.trim() : undefined
       },
 
-      ledger: async (cost, tokens, spawned) => {
+      ledger: async (cost, tokens, spawned, worker) => {
         await update($, ledgerAtom, l => ({
           cost: (l?.cost ?? 0) + cost,
           tokens: (l?.tokens ?? 0) + tokens,
           spawned: (l?.spawned ?? 0) + spawned,
         }))
+        if (worker) {
+          const level = budgetThreshold(worker.cost, worker.maxCost)
+          if (level === 'warning' && !worker.budgetWarned) {
+            worker.budgetWarned = true
+            const warning = `worker budget warning: ${money(worker.cost)} of ${money(worker.maxCost!)} (80% reached)`
+            worker.warn.push(warning)
+            void sync()
+            void worker.send?.({ type: 'steer', message: `Budget check: you have used at least 80% of your $${worker.maxCost!.toFixed(2)} worker budget. Keep remaining work concise and report what is complete.` })
+          } else if (level === 'exceeded' && worker.state === 'running') {
+            const reason = `budget exceeded: worker spent ${money(worker.cost)} of ${money(worker.maxCost!)}`
+            worker.killed = true
+            worker.runError = reason
+            worker.errors.push(reason)
+            void worker.send?.({ type: 'abort' })
+            worker.stop?.()
+            finish(worker)
+          }
+        }
+        const total = (await read($, ledgerAtom)).cost
+        const sessionLevel = budgetThreshold(total, sessionBudget)
+        if (sessionLevel === 'warning' && !sessionBudgetWarned) {
+          sessionBudgetWarned = true
+          for (const w of workers.values()) {
+            if (w.state !== 'running') continue
+            const warning = `session budget warning: ${money(total)} of ${money(sessionBudget!)} (80% reached)`
+            if (!w.warn.includes(warning)) w.warn.push(warning)
+            w.sessionBudgetWarned = true
+            void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
+          }
+          void sync()
+        } else if (sessionLevel === 'exceeded') {
+          for (const w of workers.values()) {
+            if (w.state !== 'running') continue
+            const reason = `budget exceeded: session spent ${money(total)} of ${money(sessionBudget!)}`
+            w.killed = true
+            w.runError = reason
+            w.errors.push(reason)
+            void w.send?.({ type: 'abort' })
+            w.stop?.()
+            finish(w)
+          }
+        }
       },
 
       sync: async () => {
@@ -1140,7 +1201,7 @@ export const register: Register = on => {
         $.ui.status(
           all.length === 0 && !led.spawned
             ? undefined
-            : `pi ${n('running')} running · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}`,
+            : `pi ${n('running')} running · ${n('done')} done${n('failed') ? ` · ${n('failed')} failed` : ''} · ${money(led.cost)}${sessionBudget ? ` · budget ${money(led.cost)}/${money(sessionBudget)}${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''}`,
         )
       },
 
@@ -1196,13 +1257,44 @@ export const register: Register = on => {
         w.verifyDone = false
         w.runError = undefined
         w.warn = []
+        const workerBudget = budgetThreshold(w.cost, w.maxCost)
+        if (workerBudget === 'warning') w.warn.push(`worker budget warning: ${money(w.cost)} of ${money(w.maxCost!)} (80% reached)`)
+        if (workerBudget === 'exceeded') {
+          const reason = `budget exceeded: worker spent ${money(w.cost)} of ${money(w.maxCost!)}`
+          w.killed = true
+          w.runError = reason
+          w.errors.push(reason)
+          void w.send?.({ type: 'abort' })
+          w.stop?.()
+          finish(w)
+          return
+        }
         w.win = []
         w.live = ''
         w.act = 'think'
         w.last = w.steps > 0 ? `follow-up: ${clip(one(message), 60)}` : 'starting'
         void (async () => {
           const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
+          const sessionSpent = (await read($, ledgerAtom)).cost
+          if (budgetThreshold(sessionSpent, sessionBudget) === 'exceeded') {
+            const reason = `budget exceeded: session spent ${money(sessionSpent)} of ${money(sessionBudget!)}`
+            w.killed = true
+            w.runError = reason
+            w.errors.push(reason)
+            void w.send?.({ type: 'abort' })
+            w.stop?.()
+            finish(w)
+            return
+          }
           if (!w.send && !(await startProc(w))) return
+          if (budgetThreshold(sessionSpent, sessionBudget) === 'warning') {
+            const warning = `session budget warning: ${money(sessionSpent)} of ${money(sessionBudget!)} (80% reached)`
+            if (!w.warn.includes(warning)) w.warn.push(warning)
+            if (!w.sessionBudgetWarned) {
+              w.sessionBudgetWarned = true
+              void w.send?.({ type: 'steer', message: `Budget check: session spend is at least 80% of the ${money(sessionBudget!)} session budget. Keep remaining work concise and report what is complete.` })
+            }
+          }
           if (w.effort && w.effortSent !== w.effort) {
             w.effortSent = w.effort
             await w.send?.({ type: 'set_thinking_level', level: w.effort })
@@ -1362,9 +1454,9 @@ export const register: Register = on => {
       await $.fs.write(file, '').catch(() => undefined)
       await $.fs.write(`${w.btwDir}/.keep`, '').catch(() => undefined)
       await $.fs.write(`${tmpDir(w)}/.keep`, '').catch(() => undefined)
-      w.model = w.codex ? w.model || codexModel : currentModel
+      w.model = resolveWorkerModel(w.agent, !!w.codex, codexModel, modelOverrides, currentModel, w.model)
       const args = [
-        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', w.model, '--thinking', w.effort ?? currentThinking,
+        '--mode', 'rpc', '--session-dir', `${agentDir}/sessions`, '--model', w.model!, '--thinking', w.effort ?? currentThinking,
         '--offline', '-ne', '-ns', '-np', '-nc', '-na',
       ]
       args.push('-e', `${$.plugin.root}/extensions/guard.ts`)
@@ -1479,6 +1571,7 @@ export const register: Register = on => {
             description: `Agent type (default ${DEFAULT_AGENT}). ${Object.entries(AGENTS).map(([k, a]) => `${k}: ${a.about}`).join('; ')}`,
           },
           maxMinutes: { type: 'number', description: 'time limit for the run (default depends on agent type, 15-20). At 85% the worker is told to wrap up; at 100% it is asked for a partial report and gets 2 more minutes before it is stopped. pi_send can resume it.' },
+          maxCost: { type: 'number', description: 'Optional per-worker USD budget. At 80% the worker gets a budget-check steer; at 100% it is killed with the budget-exceeded reason and its partial work remains available to pi_diff. Flat-rate use that reports $0 does not trip it.' },
           checks: { type: 'array', items: { type: 'string' }, description: 'Toolbox checks (pi_tools) the worker must run and pass after its last edit. Default: the toolbox entries marked required. [] = none for this task. The worker runs them itself with `check <name>`; serial ones never run twice at once.' },
           verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Prefer toolbox checks (pi_tools), which the worker runs and fixes itself; use verify for a final gate the worker must not run. The result goes in the digest; a failure counts as a warning.' },
           verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
@@ -1623,7 +1716,8 @@ export const register: Register = on => {
     })
 
     await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
-    await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
+    await $.command.register({ name: 'pi-model', description: 'Show or change the global or per-agent-type model Pi workers use' })
+    await $.command.register({ name: 'pi-budget', description: 'Show or change the session USD budget for Pi workers' })
     await $.command.register({ name: 'codex-worker', description: 'Show or change the Codex model and effort used by codex:true workers' })
     await $.command.register({ name: 'btw', description: 'Ask a running worker why it is slow or quiet without interrupting it' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
@@ -1662,22 +1756,38 @@ export const register: Register = on => {
 
   on('command.run', { command: 'pi-model' }, async ($, e) => {
     const arg = String((e as { args?: string }).args ?? '').trim()
-    const set = async (m: string) => {
+    const [first = '', ...rest] = arg.split(/\s+/)
+    const agentType = rest.length && AGENT_TYPES.includes(first as ModelAgentType) ? (first as ModelAgentType) : undefined
+    const queryArg = agentType ? rest.join(' ') : arg
+    const setGlobal = async (m: string) => {
       currentModel = m
       await $.store.set('model', m).catch(() => undefined)
       await update($, modelAtom, () => m)
     }
-    const status = `worker model: ${currentModel}${currentModel === DEFAULT_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_MODEL})`}`
-    if (!arg) {
-      return { text: `${status}\nChange it: /pi-model <provider/model or part of a name>. Reset: /pi-model reset. List: pi --list-models. Models other than the bundled one must exist in ~/${AGENT_DIR_NAME}/models.json or Pi's catalog.` }
+    const setOverride = async (type: ModelAgentType, m: string | undefined) => {
+      if (m) modelOverrides[type] = m
+      else delete modelOverrides[type]
+      await $.store.set('modelOverrides', modelOverrides).catch(() => undefined)
     }
-    if (arg === 'reset' || arg === 'default') {
-      await set(DEFAULT_MODEL)
+    const status = () => {
+      const global = `worker model: ${currentModel}${currentModel === DEFAULT_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_MODEL})`}`
+      const overrides = AGENT_TYPES.filter(type => modelOverrides[type]).map(type => `${type}: ${modelOverrides[type]}`)
+      return `${global}${overrides.length ? `\nper-agent overrides:\n${overrides.map(value => `  ${value}`).join('\n')}` : '\nper-agent overrides: none'}`
+    }
+    if (!arg) {
+      return { text: `${status()}\nChange global: /pi-model <provider/model or part of a name>. Change one type: /pi-model <agentType> <model>; clear: /pi-model <agentType> reset. List: pi --list-models. Models other than the bundled one must exist in ~/${AGENT_DIR_NAME}/models.json or Pi's catalog.` }
+    }
+    if (!agentType && (arg === 'reset' || arg === 'default')) {
+      await setGlobal(DEFAULT_MODEL)
       return { text: `worker model reset to ${DEFAULT_MODEL}. Applies to workers started or resumed from now on.` }
+    }
+    if (agentType && (queryArg === 'reset' || queryArg === 'default')) {
+      await setOverride(agentType, undefined)
+      return { text: `${agentType} model override cleared. It now uses ${modelOverrides[agentType] ?? currentModel}.` }
     }
     const notReady = await ensureSetup()
     if (notReady) return { text: notReady }
-    const query = arg.includes('/') ? arg.split('/').slice(1).join('/') : arg
+    const query = queryArg.includes('/') ? queryArg.split('/').slice(1).join('/') : queryArg
     // `pi --list-models <query>` prints a table: provider, model, context, ...
     const listed = await $.process
       .run(['pi', '--list-models', query], { env: { PI_CODING_AGENT_DIR: agentDir, OPENCODE_GO_API_KEY: apiKey }, timeoutMs: 30_000 })
@@ -1690,17 +1800,45 @@ export const register: Register = on => {
             .filter(c => c.length >= 2 && c[0] !== 'provider')
             .map(c => ({ selector: `${c[0]}/${c[1]}`, context: c[2] }))
         : undefined
-    if (!models) return { text: `could not read the model list from pi. ${status}` }
-    const exact = models.filter(m => m.selector === arg)
-    const hits = exact.length ? exact : models.filter(m => m.selector.includes(arg) || !arg.includes('/'))
-    if (!hits.length) return { text: `no pi model matches "${arg}". ${status}` }
+    if (!models) return { text: `could not read the model list from pi. ${status()}` }
+    const exact = models.filter(m => m.selector === queryArg)
+    const hits = exact.length ? exact : models.filter(m => m.selector.includes(queryArg) || !queryArg.includes('/'))
+    if (!hits.length) return { text: `no pi model matches "${queryArg}". ${status()}` }
     if (hits.length > 1) {
       const list = hits.slice(0, 10).map(m => `  ${m.selector}`).join('\n')
-      return { text: `${hits.length} models match "${arg}"; pass the exact selector:\n${list}${hits.length > 10 ? '\n  …' : ''}\n${status}` }
+      return { text: `${hits.length} models match "${queryArg}"; pass the exact selector:\n${list}${hits.length > 10 ? '\n  …' : ''}\n${status()}` }
     }
     const m = hits[0]!
-    await set(m.selector)
+    if (agentType) {
+      await setOverride(agentType, m.selector)
+      return { text: `${agentType} worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers of that type started or resumed from now on; running workers keep theirs.` }
+    }
+    await setGlobal(m.selector)
     return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
+  })
+
+  on('command.run', { command: 'pi-budget' }, async ($, e) => {
+    const arg = String((e as { args?: string }).args ?? '').trim()
+    const spent = (await read($, ledgerAtom)).cost
+    if (!arg) {
+      return { text: sessionBudget === undefined ? `session budget: off · spent ${money(spent)}\nSet it: /pi-budget <usd>; clear it: /pi-budget off.` : `session budget: ${money(spent)} of ${money(sessionBudget)}${budgetThreshold(spent, sessionBudget) === 'warning' ? ' · warning at 80%' : budgetThreshold(spent, sessionBudget) === 'exceeded' ? ' · exceeded' : ''}\nChange it: /pi-budget <usd>; clear it: /pi-budget off.` }
+    }
+    if (arg.toLowerCase() === 'off') {
+      sessionBudget = undefined
+      sessionBudgetWarned = false
+      for (const w of workers.values()) w.sessionBudgetWarned = false
+      await $.store.set('budget', null).catch(() => undefined)
+      await B?.ledger(0, 0, 0)
+      return { text: `session budget cleared · spent ${money(spent)}` }
+    }
+    const cap = Number(arg)
+    if (!Number.isFinite(cap) || cap <= 0) return { text: 'usage: /pi-budget <positive usd amount> | /pi-budget off' }
+    sessionBudget = cap
+    sessionBudgetWarned = false
+    for (const w of workers.values()) w.sessionBudgetWarned = false
+    await $.store.set('budget', cap).catch(() => undefined)
+    await B?.ledger(0, 0, 0)
+    return { text: `session budget set to ${money(cap)} · spent ${money(spent)}${budgetThreshold(spent, cap) === 'warning' ? ' · warning at 80%' : budgetThreshold(spent, cap) === 'exceeded' ? ' · exceeded; running workers stopped' : ''}` }
   })
 
   on('command.run', { command: 'btw' }, async ($, e) => {
@@ -1818,6 +1956,10 @@ export const register: Register = on => {
     if (notReady) return text(notReady, true)
     const task = String(e.task ?? '').trim()
     if (!task) return text('task is required', true)
+    if (sessionBudget !== undefined) {
+      const spent = (await read($, ledgerAtom)).cost
+      if (spent >= sessionBudget) return text(`session budget exceeded: spent ${money(spent)} of ${money(sessionBudget)}; /pi-budget off or raise the cap before spawning`, true)
+    }
     if (running() >= MAX_WORKERS) {
       return text(`max ${MAX_WORKERS} concurrent workers; wait for one to finish first`, true)
     }
@@ -1825,6 +1967,7 @@ export const register: Register = on => {
     const kind = AGENTS[agent]
     if (!kind) return text(`unknown agent "${agent}"; choose one of: ${Object.keys(AGENTS).join(', ')}`, true)
     if (e.effort !== undefined && !THINKING_LEVELS.includes(String(e.effort))) return text(`effort must be one of ${THINKING_LEVELS.join(', ')}`, true)
+    if (e.maxCost !== undefined && (typeof e.maxCost !== 'number' || !Number.isFinite(e.maxCost) || e.maxCost <= 0)) return text('maxCost must be a positive USD number', true)
     const codex = e.codex === true
     if (codex && e.effort !== undefined) return text(`a codex worker runs at the /codex-worker effort (${codexThinking}); drop effort`, true)
     if (codex && !(await codexReady())) return text(CODEX_LOGIN, true)
@@ -1914,7 +2057,7 @@ export const register: Register = on => {
       worktree,
       sub,
       branch,
-      model: codex ? codexModel : currentModel,
+      model: resolveWorkerModel(agent, codex, codexModel, modelOverrides, currentModel),
       codex: codex || undefined,
       skills: skills.length ? skills : undefined,
       agent,
@@ -1936,6 +2079,7 @@ export const register: Register = on => {
       genMs: 0,
       spark: [],
       maxMinutes: typeof e.maxMinutes === 'number' && e.maxMinutes > 0 ? Math.min(e.maxMinutes, 240) : kind.maxMinutes,
+      maxCost: typeof e.maxCost === 'number' ? e.maxCost : undefined,
       verify: typeof e.verify === 'string' && e.verify.trim() ? e.verify.trim() : undefined,
       verifyTimeout: typeof e.verifyTimeoutSec === 'number' ? e.verifyTimeoutSec : undefined,
       fixesLeft: typeof e.fixRounds === 'number' ? Math.min(3, Math.max(0, Math.floor(e.fixRounds))) : 0,
@@ -2078,14 +2222,14 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__omp-conductor__pi_status' }, async $ => {
     const led = await read($, ledgerAtom)
-    if (!workers.size) return text(`no workers · session ${money(led.cost)}`)
+    if (!workers.size) return text(`no workers · session ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''}`)
     return text(
       [...workers.values()]
         .map(w => {
           const r = (w.state === 'running' ? liveTps(w, Date.now()) : undefined) ?? w.tps
           return `[${w.id}] ${w.state} ${elapsed(w)} files=${w.files.size}${r ? ` ⚡${Math.round(r)}tok/s` : ''} ${money(w.cost)}${w.warn.length ? ` ⚠${w.warn.length}` : ''} — ${w.title} — ${w.last}`
         })
-        .concat(`session total ${money(led.cost)} · ${led.spawned} spawned`)
+        .concat(`session total ${money(led.cost)}${sessionBudget ? ` / ${money(sessionBudget)} budget${budgetThreshold(led.cost, sessionBudget) !== 'none' ? ' ⚠' : ''}` : ''} · ${led.spawned} spawned`)
         .join('\n'),
     )
   })
