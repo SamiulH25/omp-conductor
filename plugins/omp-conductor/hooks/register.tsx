@@ -124,6 +124,7 @@ Set up (once):
   1. Install Pi (needs Node 22.19+): npm install -g --ignore-scripts @earendil-works/pi-coding-agent   (or: curl -fsSL https://pi.dev/install.sh | sh)
   2. Put your OpenCode Go key where the plugin can read it: echo 'OPENCODE_GO_API_KEY=<your key>' > ~/${AGENT_DIR_NAME}/env && chmod 600 ~/${AGENT_DIR_NAME}/env   (or export OPENCODE_GO_API_KEY in the environment Claude Code starts from)
   3. Restart Claude Code, or just ask for a worker again: while Pi is not ready the check re-runs on every spawn, so no restart is needed.
+Full guide with links: /pi-setup
 The plugin creates ~/${AGENT_DIR_NAME}/ (worker prompt, models, sessions) by itself; nothing else needs configuring.`
 
 // The worker simplifies its own work: every task ends with a SUMMARY block the digest quotes.
@@ -353,6 +354,45 @@ async function loadTools($: any, root: string, dir: string): Promise<Toolbox> {
   if (unity !== undefined) return { checks: UNITY_TOOLS, source: 'unity default', sub: unity }
   return { checks: {}, source: 'none', sub: '' }
 }
+
+// /pi-setup: the install guide, shareable with someone setting it up from scratch.
+const REPO = 'SamiulH25/omp-conductor'
+const BRANCH = 'pi-backend'
+const SETUP_GUIDE = `omp-conductor: install guide
+Claude runs several Pi workers in parallel (each a long-lived \`pi --mode rpc\` process) and judges, merges and cleans up their work.
+Repo: https://github.com/${REPO}/tree/${BRANCH}
+
+1. Requirements
+   - Claude Code with plugin support: https://docs.claude.com/en/docs/claude-code (check: claude --version)
+   - Node.js 22.19 or newer: https://nodejs.org (check: node --version)
+   - git (workers get isolated git worktrees): https://git-scm.com
+
+2. Install Pi, the coding agent the workers run on (https://pi.dev)
+     npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+   or
+     curl -fsSL https://pi.dev/install.sh | sh
+   check: pi --version
+
+3. Get an OpenCode Go key (the workers' model provider): https://opencode.ai/docs/go/
+   Save it where the plugin reads it (never commit or share this file):
+     mkdir -p ~/${AGENT_DIR_NAME}
+     echo 'OPENCODE_GO_API_KEY=<your key>' > ~/${AGENT_DIR_NAME}/env
+     chmod 600 ~/${AGENT_DIR_NAME}/env
+   (or export OPENCODE_GO_API_KEY in the shell Claude Code starts from)
+
+4. Install the plugin
+     claude plugin marketplace add ${REPO}#${BRANCH}
+     claude plugin install omp-conductor@omp-conductor-marketplace
+   Then restart Claude Code. Update later with:
+     claude plugin marketplace update omp-conductor-marketplace
+     claude plugin update omp-conductor@omp-conductor-marketplace
+
+5. Check it
+   Run /pi-setup again: every line below should be ✔. Then /conductor opens the workers pane, and you can ask Claude to "use Pi workers" for a task that splits into parallel pieces.
+
+Optional
+   - Unity projects: install the Unity CLI so workers can compile and run tests themselves (https://unity.com, check: unity --version). The plugin sets up unity-compile / unity-editmode checks by itself.
+   - /pi-model changes the worker model, /pi-effort the reasoning effort.`
 
 export const register: Register = on => {
   const workers = new Map<string, Worker>()
@@ -1363,6 +1403,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'conductor', description: 'Show or hide the omp-conductor workers pane' })
     await $.command.register({ name: 'pi-model', description: 'Show or change the model every Pi worker uses' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
+    await $.command.register({ name: 'pi-setup', description: 'Install guide for omp-conductor and Pi, with a check of what this machine still needs' })
 
     $.clock.every(1000, () => {
       if (running() > 0) void sync()
@@ -1436,6 +1477,28 @@ export const register: Register = on => {
     const m = hits[0]!
     await set(m.selector)
     return { text: `worker model set to ${m.selector}${m.context ? ` (${m.context} context)` : ''}. Applies to workers started or resumed from now on; running workers keep theirs. Resumed workers whose process was stopped start a new one with this model.` }
+  })
+
+  on('command.run', { command: 'pi-setup' }, async $ => {
+    // What this machine has: the guide plus a live checklist.
+    const ver = async (argv: string[]) => {
+      const r = await $.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
+      return r && r.exitCode === 0 ? (r.stdout.trim() || r.stderr.trim()).split('\n')[0] : undefined
+    }
+    await ensureSetup()
+    const [node, git, pi, unity] = await Promise.all([ver(['node', '--version']), ver(['git', '--version']), ver(['pi', '--version']), ver(['unity', '--version'])])
+    const [maj, min] = (node ?? '').replace(/^v/, '').split('.').map(Number)
+    const nodeOk = !!node && (maj! > 22 || (maj === 22 && min! >= 19))
+    const rows: [boolean | undefined, string][] = [
+      [nodeOk, `Node.js 22.19+${node ? ` (found ${node})` : ' (not found)'}`],
+      [!!git, 'git'],
+      [!!pi, `Pi${pi ? ` (${pi})` : ' (not on PATH)'}`],
+      [!!apiKey, `OpenCode Go key${apiKey ? '' : ` (none in ~/${AGENT_DIR_NAME}/env or the environment)`}`],
+      [unity ? true : undefined, `Unity CLI (optional, Unity projects only)${unity ? '' : ': not installed'}`],
+    ]
+    const status = rows.map(([ok, label]) => `   ${ok === true ? '✔' : ok === false ? '✘' : '·'} ${label}`).join('\n')
+    const ready = rows.slice(0, 4).every(([ok]) => ok)
+    return { text: `${SETUP_GUIDE}\n\nThis machine:\n${status}\n${ready ? 'Ready: workers can start.' : 'Not ready yet: finish the ✘ steps above, then run /pi-setup again (no restart needed for the key or Pi).'}` }
   })
 
   on('command.run', { command: 'pi-effort' }, async ($, e) => {

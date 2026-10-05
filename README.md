@@ -1,5 +1,7 @@
 # omp-conductor
 
+A native Codex port is available in [plugins/omp-conductor-codex](plugins/omp-conductor-codex/README.md), with an MCP server and Codex skill. The Claude plugin below remains available.
+
 A Claude Code plugin that lets Claude run several [Pi](https://pi.dev) workers in parallel, read compact digests of their work instead of raw logs, and judge, steer, merge and clean up. Each worker is one long-lived `pi --mode rpc` process, so it can be recalled for fixes without re-learning the codebase.
 
 ## Requirements
@@ -9,14 +11,17 @@ A Claude Code plugin that lets Claude run several [Pi](https://pi.dev) workers i
   - an [OpenCode Go](https://opencode.ai/docs/go/) key, either in `~/.pi-workers/env` as `OPENCODE_GO_API_KEY=<key>` (`chmod 600`) or in the environment (`OPENCODE_GO_API_KEY` or `OPENCODE_API_KEY`)
   - Everything else is created for you in `~/.pi-workers/` on first run (a short worker system prompt, `models.json` for the Go endpoint, `settings.json`). Edit those files to change the worker prompt, add models or change default tools; the plugin never overwrites them.
 - `git` (workers get isolated worktrees in git repos)
+- Linux or macOS (the `check` runner needs only Node)
 - A Claude Code build with function-hook plugins (tested with 2.1.286)
 
 ## Install
 
 ```
-claude plugin marketplace add SamiulH25/omp-conductor
+claude plugin marketplace add SamiulH25/omp-conductor#pi-backend
 claude plugin install omp-conductor@omp-conductor-marketplace
 ```
+
+Restart Claude Code, then run `/pi-setup`: it prints the full install guide (Pi, the OpenCode Go key, links) and a checklist of what this machine still needs. Share its output with anyone setting the plugin up.
 
 Restart Claude Code, then ask Claude to spawn workers. The `orchestrate-pi` skill gives it the playbook.
 

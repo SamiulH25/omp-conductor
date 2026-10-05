@@ -4,12 +4,12 @@
 //   check            list the checks this worker has
 //   check <name> [args]  run one; args go where its command has {args}, else at the end
 //   check all            run every required check
-// A serial check holds a lock shared by every worker of the project, so two workers never run a tool that
+// A serial check holds a lock shared by every worker of the project (a directory lock, no flock needed), so two workers never run a tool that
 // cannot run twice (a Unity editor, a Gradle daemon) at once; the second one waits. The full output goes to a
 // log in $TMPDIR; what is printed is the verdict, the failures and the log tail, so it stays small.
 // Every run is appended to $TMPDIR/checks.jsonl, which the supervisor reads.
 import { spawnSync } from 'node:child_process'
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 const file = process.env.PI_CHECKS_FILE
@@ -38,6 +38,56 @@ if (!arg || arg === '-h' || arg === '--help' || arg === 'list') {
   process.exit(0)
 }
 
+// Runs the check in its own process group, so a timeout ends everything it started (an editor, a daemon), not
+// only the shell. $0 is the check's command.
+const GROUP = 'set -m; bash -c "$0" & p=$!; trap \'kill -TERM -$p 2>/dev/null; for i in 1 2 3 4 5; do kill -0 -$p 2>/dev/null || break; sleep 1; done; kill -KILL -$p 2>/dev/null; exit 124\' TERM; wait $p'
+const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+// A process's command line, or '' when it is gone (Linux /proc, else ps for macOS).
+const commandOf = pid => {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8')
+  } catch {
+    const r = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+    return r.status === 0 ? r.stdout.trim() : ''
+  }
+}
+// A directory lock (mkdir is atomic everywhere) holding the owner's PID; a lock whose owner died is taken over.
+const lock = (path, name) => {
+  const dir = `${path}.d`
+  mkdirSync(dirname(dir), { recursive: true })
+  let told = false
+  for (;;) {
+    try {
+      mkdirSync(dir)
+      writeFileSync(`${dir}/pid`, String(process.pid))
+      return () => rmSync(dir, { recursive: true, force: true })
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+      let owner = ''
+      try {
+        owner = readFileSync(`${dir}/pid`, 'utf8').trim()
+      } catch {
+        // just created by another runner, pid not written yet
+      }
+      let alive = true
+      if (owner) {
+        try {
+          process.kill(Number(owner), 0)
+        } catch (e) {
+          alive = e.code === 'EPERM'
+        }
+      }
+      if (!alive) {
+        rmSync(dir, { recursive: true, force: true })
+        continue
+      }
+      if (!told) console.log(`check ${name}: waiting for another worker's run to finish`)
+      told = true
+      sleep(2000)
+    }
+  }
+}
+
 const expand = s => (s ? s.replace(/\$\{?TMPDIR\}?/g, tmp) : s)
 const run = (name, extraArgs = []) => {
   const c = box.checks[name]
@@ -54,37 +104,37 @@ const run = (name, extraArgs = []) => {
   const q = s => `'${s.replace(/'/g, `'\\''`)}'`
   const extra = (extraArgs[0] === '--' ? extraArgs.slice(1) : extraArgs).map(q).join(' ')
   const command = c.command.includes('{args}') ? c.command.replace('{args}', extra) : extra ? `${c.command} ${extra}` : c.command
-  // timeout inside flock: the wait for the lock does not eat into the check's own time limit
-  const inner = ['timeout', '-k', '20', String(secs), 'bash', '-c', command]
-  if (c.serial && c.lock) mkdirSync(dirname(c.lock), { recursive: true })
-  const argv = c.serial && c.lock ? ['flock', c.lock, ...inner] : inner
   console.log(`check ${name}: running \`${command.replace(/ {2,}/g, ' ')}\` in ${box.cwd}${c.serial ? ' (one at a time across workers; may wait for another worker first)' : ''}`)
-  const t0 = Date.now()
+  // Plain node (no flock or GNU timeout), so it runs the same on Linux and macOS.
+  const release = c.serial && c.lock ? lock(c.lock, name) : () => {}
+  const t0 = Date.now() // after the lock: the wait does not eat into the check's own time limit
   let exit
-  for (;;) {
-    const fd = openSync(log, 'w')
-    const r = spawnSync(argv[0], argv.slice(1), { cwd: box.cwd, stdio: ['ignore', fd, fd], env: process.env })
-    closeSync(fd)
-    exit = r.status ?? (r.signal ? 128 : 1)
-    // retryIf: the tool is held by another process for a while (the supervisor's own test run). When the regex
-    // captures a PID, wait only while that process is a batch run: an app the user keeps open never lets go.
-    const held = exit !== 0 && c.retryIf ? new RegExp(c.retryIf).exec(readFileSync(log, 'utf8')) : null
-    if (!held || Date.now() - t0 > secs * 1000) break
-    let cmdline = ''
-    try {
-      cmdline = held[1] ? readFileSync(`/proc/${held[1]}/cmdline`, 'utf8') : 'batchmode'
-    } catch {
-      // the holder is already gone: retry at once
+  let timedOut = false
+  try {
+    for (;;) {
+      const fd = openSync(log, 'w')
+      const left = secs * 1000 - (Date.now() - t0)
+      const r = spawnSync('bash', ['-c', GROUP, command], { cwd: box.cwd, stdio: ['ignore', fd, fd], env: process.env, timeout: Math.max(1000, left), killSignal: 'SIGTERM' })
+      closeSync(fd)
+      timedOut = r.error?.code === 'ETIMEDOUT'
+      exit = timedOut ? 124 : (r.status ?? (r.signal ? 128 : 1))
+      // retryIf: the tool is held by another process for a while (the supervisor's own test run). When the regex
+      // captures a PID, wait only while that process is a batch run: an app the user keeps open never lets go.
+      const held = exit !== 0 && !timedOut && c.retryIf ? new RegExp(c.retryIf).exec(readFileSync(log, 'utf8')) : null
+      if (!held || Date.now() - t0 > secs * 1000) break
+      const cmdline = held[1] ? commandOf(held[1]) : 'batchmode'
+      if (cmdline && !/batchmode/i.test(cmdline)) break
+      console.log(`check ${name}: held by another run${held[1] ? ` (PID ${held[1]})` : ''}; waiting 15 s and retrying`)
+      sleep(15_000)
     }
-    if (cmdline && !/batchmode/i.test(cmdline)) break
-    console.log(`check ${name}: held by another run${held[1] ? ` (PID ${held[1]})` : ''}; waiting 15 s and retrying`)
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15_000)
+  } finally {
+    release()
   }
   const ok = exit === 0
   const secsTaken = Math.round((Date.now() - t0) / 1000)
 
   const out = []
-  out.push(`check ${name}: ${ok ? 'PASS' : exit === 124 ? `TIMED OUT after ${secs}s` : `FAIL (exit ${exit})`} in ${secsTaken}s. Full log: ${log}`)
+  out.push(`check ${name}: ${ok ? 'PASS' : timedOut ? `TIMED OUT after ${secs}s` : `FAIL (exit ${exit})`} in ${secsTaken}s. Full log: ${log}`)
   const failures = report && existsSync(report) ? parseReport(readFileSync(report, 'utf8')) : undefined
   if (failures) out.push(failures.total != null ? `tests: ${failures.total} run, ${failures.failed.length} failed` : '', ...failures.failed.slice(0, 15))
   else if (report && !ok) out.push(`(no test report at ${report}: the run ended before tests ran, e.g. a compile error, a lock or a crash)`)
