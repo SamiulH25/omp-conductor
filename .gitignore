@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+plugins/omp-conductor-codex/node_modules/
+plugins/omp-conductor-codex/dist/test/
+plugins/omp-conductor-codex/artifacts/
