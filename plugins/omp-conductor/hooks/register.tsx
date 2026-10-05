@@ -53,6 +53,46 @@ function detectStuck(
   return findings
 }
 
+// Inline copies are needed because the hook loader may not resolve runtime relative imports.
+// extensions/owns.ts is the tested copy used by guard.ts; keep these helpers in sync with it.
+const normalize = (path: string) => path.replace(/\\/g, '/').replace(/^\.\//, '')
+
+function matchesGlob(pattern: string, path: string): boolean {
+  const glob = normalize(pattern)
+  const file = normalize(path)
+  let source = '^'
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i]!
+    if (ch === '*' && glob[i + 1] === '*') {
+      i++
+      if (glob[i + 1] === '/') {
+        i++
+        source += '(?:.*/)?'
+      } else source += '.*'
+    } else if (ch === '*') source += '[^/]*'
+    else if (ch === '?') source += '[^/]'
+    else source += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`${source}$`).test(file)
+}
+
+function matchesAny(patterns: readonly string[], path: string): boolean {
+  return patterns.some(pattern => matchesGlob(pattern, path))
+}
+
+function patternsOverlap(a: string, b: string): boolean {
+  const left = normalize(a)
+  const right = normalize(b)
+  const leftWildcard = /[*?]/.test(left)
+  const rightWildcard = /[*?]/.test(right)
+  if (!leftWildcard && !rightWildcard) return left === right
+  const prefix = (pattern: string) => pattern.slice(0, pattern.search(/[*?]/) < 0 ? pattern.length : pattern.search(/[*?]/))
+  const lp = prefix(left)
+  const rp = prefix(right)
+  if (!lp || !rp) return true
+  return lp.startsWith(rp) || rp.startsWith(lp)
+}
+
 const PANE = 'omp-conductor'
 const MAX_WORKERS = 4
 const MAX_EVENTS = 300
@@ -331,6 +371,7 @@ type Worker = {
   effortSent?: string
   codex?: boolean // pinned to the /codex-worker model and effort at spawn, for its whole life, resumes included
   skills?: Skill[] // skills the supervisor pushed (pi_spawn / pi_send): --skill on every process start
+  owns?: string[] // file glob patterns this worker may edit
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
   snapDir?: string // non-git dirs: originals of files the worker edited (written by the guard extension)
   btwDir?: string
@@ -845,7 +886,7 @@ export const register: Register = on => {
   const digest = async (w: Worker, full = false) => {
     const lines: string[] = []
     const kind = AGENTS[w.agent] ?? AGENTS[DEFAULT_AGENT]!
-    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}`)
+    lines.push(`[${w.id}] ${w.title} — ${w.state} (${elapsed(w)}) ${w.agent} session=${w.session ?? '?'}` + (w.owns !== undefined ? ` owns=${w.owns.join(', ') || '(none)'}` : ''))
     lines.push(`dir: ${workDir(w)}${w.worktree ? ' (worktree)' : ''}`)
     if (w.interruptedRun) lines.push(`previous run interrupted: ${w.interruptedRun}`)
     const files = [...w.files]
@@ -1433,6 +1474,7 @@ export const register: Register = on => {
       TMPDIR: tmpDir(w), // scratch files stay out of the project and out of /tmp
       ...(w.snapDir ? { PI_SNAPSHOT_DIR: w.snapDir } : {}),
       ...(w.worktree ? { PI_MAIN_ROOT: w.root, PI_WORK_ROOT: w.worktree } : {}), // the guard keeps the worker inside its worktree
+      ...(w.owns !== undefined ? { PI_OWNS: JSON.stringify(w.owns) } : {}),
       PATH: `${$.plugin.root}/bin${hostPath ? `:${hostPath}` : ''}`, // the `check` runner
       PI_CHECKS_FILE: `${tmpDir(w)}/checks.json`,
       PI_CHECKS_REQUIRED: (w.checks ?? []).join(','), // the guard asks for these after the last edit
@@ -1554,7 +1596,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'pi_spawn',
       description:
-        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs or let worktree isolation separate parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
+        'Start a Pi worker in the background on a self-contained task and return its id at once. Workers use the model the user set with /pi-model, or Codex with codex:true. Give it a complete standalone brief (it has no access to this conversation). Use disjoint dirs, worktree isolation, or owns patterns to avoid merge conflicts between parallel workers. Then use pi_wait / pi_digest to read compact results and judge them. Workers are long-lived RPC processes that keep their context: for a fix or a follow-up in the same area, pi_send an existing worker instead of spawning a new one.',
       inputSchema: obj(
         {
           task: { type: 'string', description: 'Complete standalone instructions for the worker' },
@@ -1570,6 +1612,7 @@ export const register: Register = on => {
           verify: { type: 'string', description: 'A shell command the PLUGIN runs itself in the worker\'s directory after the worker finishes (one at a time across workers, up to 10 min). Prefer toolbox checks (pi_tools), which the worker runs and fixes itself; use verify for a final gate the worker must not run. The result goes in the digest; a failure counts as a warning.' },
           verifyTimeoutSec: { type: 'number', description: 'Time limit for the verify command (default 300, max 600).' },
           fixRounds: { type: 'number', description: 'With verify: how many times (0-3, default 0) a failing verify is sent back to the worker to fix automatically.' },
+          owns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns of files this worker may edit (relative to its dir/worktree root); use owned patterns so parallel workers avoid merge conflicts.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
           codex: { type: 'boolean', description: `Run this worker on Codex (the /codex-worker model, default ${CODEX_MODEL}, via the user's ChatGPT subscription) at the /codex-worker effort (default ${CODEX_THINKING}) instead of the /pi-model model; effort cannot be combined with it. Slower and stronger: use it for hard reasoning, tricky bugs and careful reviews, not routine edits.` },
@@ -1945,6 +1988,12 @@ export const register: Register = on => {
     if (notReady) return text(notReady, true)
     const task = String(e.task ?? '').trim()
     if (!task) return text('task is required', true)
+    const owns = e.owns === undefined
+      ? undefined
+      : Array.isArray(e.owns) && e.owns.every((p: unknown) => typeof p === 'string' && p.trim())
+        ? (e.owns as string[]).map(p => p.trim())
+        : null
+    if (owns === null) return text('owns must be an array of non-empty glob patterns', true)
     if (running() >= MAX_WORKERS) {
       return text(`max ${MAX_WORKERS} concurrent workers; wait for one to finish first`, true)
     }
@@ -1975,6 +2024,16 @@ export const register: Register = on => {
       }
     }
     const projRoot = isGit ? top!.stdout.trim() : dir
+    if (owns?.length) {
+      for (const other of workers.values()) {
+        if (other.root !== projRoot || !['running', 'queued'].includes(other.state as string) || !other.owns?.length) continue
+        const overlap = owns.flatMap(pattern => other.owns!.map(existing => ({ pattern, existing }))).find(pair => patternsOverlap(pair.pattern, pair.existing))
+        if (overlap) {
+          seq -= 1
+          return text(`owns pattern "${overlap.pattern}" overlaps ${other.id}'s owned pattern "${overlap.existing}"`, true)
+        }
+      }
+    }
     let skills: Skill[] = []
     if (Array.isArray(e.skills) && e.skills.length) {
       const r = await resolveSkills($, home, projRoot, (e.skills as unknown[]).map(String))
@@ -2044,6 +2103,7 @@ export const register: Register = on => {
       model: codex ? codexModel : currentModel,
       codex: codex || undefined,
       skills: skills.length ? skills : undefined,
+      owns,
       agent,
       state: 'running',
       startedAt: Date.now(),
@@ -2365,8 +2425,15 @@ export const register: Register = on => {
     if (!w) return text(`no worker ${String(e.id)}`, true)
     const cap = Math.min(Math.max(Number(e.maxChars ?? 8000), 500), 40000)
     // No isolated worktree (a non-git dir, or worktree:false): diff against the originals the guard saved.
-    if (!w.worktree) return text((await B?.nonGitDiff(w, cap)) ?? 'not ready', false)
+    if (!w.worktree) {
+      const diff = (await B?.nonGitDiff(w, cap)) ?? 'not ready'
+      if (w.owns === undefined) return text(diff, false)
+      const changed = (await B?.changed(w)) ?? []
+      const outside = changed.filter(file => !matchesAny(w.owns!, file))
+      return text(`${outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}\n\n` : ''}${diff}`, false)
+    }
     const cwdW = workDir(w)
+    const ownershipDiff = await $.process.run(['git', 'diff', '--name-only', 'HEAD'], { cwd: w.worktree, timeoutMs: 20_000 })
     const stat = await $.process.run(['git', 'diff', '--stat', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
     const diff = await $.process.run(['git', 'diff', 'HEAD'], { cwd: cwdW, timeoutMs: 20_000 })
     const untracked = await $.process.run(['git', 'ls-files', '--others', '--exclude-standard'], {
@@ -2375,6 +2442,9 @@ export const register: Register = on => {
     })
     // New files have no tracked diff: show their content as additions (first few, so a review sees what was created).
     const fresh = untracked.stdout.split('\n').filter(f => f && !/__pycache__|\.pyc$/.test(f))
+    const ownershipNames = [...ownershipDiff.stdout.split('\n').filter(Boolean), ...fresh.map(f => `${w.sub?.replace(/^\//, '')}${w.sub ? '/' : ''}${f}`)]
+    const outside = w.owns === undefined ? [] : [...new Set(ownershipNames)].filter(file => !matchesAny(w.owns!, file))
+    const ownershipWarning = outside.length ? `⚠ outside owns:\n${outside.map(file => `${file} — ⚠ outside owns`).join('\n')}` : ''
     const created: string[] = []
     for (const f of fresh.slice(0, 8)) {
       const d = await $.process.run(['git', 'diff', '--no-index', '--', '/dev/null', f], { cwd: cwdW, timeoutMs: 20_000 }).catch(() => undefined)
@@ -2382,6 +2452,7 @@ export const register: Register = on => {
     }
     const out = [
       stat.stdout.trim() || '(no tracked changes)',
+      ownershipWarning,
       fresh.length ? `untracked (${fresh.length}):\n${fresh.join('\n')}` : '',
       clip(diff.stdout, cap),
       ...created,
