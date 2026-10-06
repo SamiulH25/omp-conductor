@@ -101,6 +101,10 @@ Pick `agent` on `pi_spawn` by what the worker may do:
 
 When a worker runs past its expected time or goes quiet (the plugin also flags `possibly stuck` / `looping` as a ⚠ and, where it can, attaches the worker's own explanation), call `pi_btw` before killing or steering it: it asks the running worker what it is doing and why without interrupting it. `pi_log` shows its recent tool calls and errors. If it is stuck or looping, redirect it with `pi_send` and `interrupt: true` (aborts the run and sends the new instruction in the same process, keeping its context) or `pi_kill`; if it is making progress, keep waiting.
 
+## Choosing the runtime
+
+Workers run on Pi by default. Pass `backend: "agy"` to run one on the Antigravity CLI (the user's Google AI Pro account: Gemini, Claude and GPT-OSS models; `/agy-model` picks the model). Use it for work that benefits from a stronger or different model at no per-token cost. An agy worker needs a git repo and has no `owns`, `pi_btw`, manager role or guard checks, so keep it to self-contained dev/general tasks and review its diff as usual.
+
 ## Scheduling, safety and cost
 
 - **Queue**: spawning past the 4-worker limit queues the worker and starts it when a slot frees; `pi_wait` covers queued workers.

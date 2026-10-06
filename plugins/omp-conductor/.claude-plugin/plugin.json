@@ -1,6 +1,6 @@
 {
   "name": "omp-conductor",
-  "version": "4.2.0",
+  "version": "4.2.1",
   "description": "Lets Claude run several Pi workers (long-lived pi --mode rpc processes) in parallel in isolated git worktrees, recall them for fixes, read compact digests of their work, and judge, steer, merge and clean up. Needs Pi installed and an OpenCode Go key.",
   "author": {
     "name": "bob2142"

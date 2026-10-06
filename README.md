@@ -74,6 +74,12 @@ The `orchestrate-pi` skill describes two modes; say which you want.
 
 Hand each feature to a **manager** (`pi_spawn { agent: "manager" }`) instead of a plain worker. A manager is a sub-orchestrator: it has no edit tools, decomposes the feature, launches sub-workers with its own tools (`sub_spawn`, `sub_wait`, `sub_status`, `sub_digest`, `sub_diff`, `sub_send`, `sub_merge`, `sub_cleanup`, `sub_kill`, `sub_log`, `sub_btw`, provided by `extensions/manager.ts` over a file bridge), merges their branches into its own integration branch, runs the checks, and reports back for approval. The orchestrator only talks to its direct children (managers and the plain workers it launched itself); sub-workers appear indented in `pi_status` but cannot be addressed. Only managers can launch workers, one level deep. Sub-worker cost rolls up into the manager, `maxCost` covers the whole tree, up to 4 managers run at once, `maxSubWorkers` (default 3) caps a manager's running sub-workers, and killing or cleaning up a manager cascades to its sub-workers.
 
+## agy workers (Antigravity CLI)
+
+`pi_spawn { backend: "agy" }` runs the worker on the Antigravity CLI (`agy`) with your Google AI Pro account instead of Pi, so it can use the Gemini, Claude and GPT-OSS models that account offers. Requires the `antigravity-cli` package, signed in once by running `agy`. `/agy-model` shows the model, `/agy-model list` lists the ids from `agy models`, `/agy-model <name>` sets it (default `gemini-3.8-flash-high`); `model` on `pi_spawn` overrides it for one worker. Reasoning effort is part of the model id (`-low`, `-medium`, `-high`).
+
+An agy worker is one `agy --input-format stream-json` process fed by the same command file as a Pi worker. Its NDJSON events are translated into the events the plugin already reads, so status, digests, `pi_wait`, `pi_log`, `pi_diff`, `pi_merge`, `pi_send` follow-ups (they resume the same conversation), the toolbox `check` runner, the dictionary and shared notes all work unchanged. Cost shows as `plan`. Differences: agy workers always get a git worktree (its plan mode does not enforce read-only), there is no `owns` enforcement, `pi_btw`, `reviewBy` guard nudges or manager role (those need the Pi extensions), and `pi_send` `interrupt` ends the process and resumes the conversation.
+
 ## Scheduling, safety and recovery
 
 - **Queue and dependencies**: spawns beyond 4 queue (FIFO); `after: [ids]` starts a worker when its upstream workers are done and passes their reports; a failed upstream fails the dependent clearly.
