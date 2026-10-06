@@ -103,7 +103,7 @@ When a worker runs past its expected time or goes quiet (the plugin also flags `
 
 ## Choosing the runtime
 
-Workers run on Pi by default. Pass `backend: "agy"` to run one on the Antigravity CLI (the user's Google AI Pro account: Gemini, Claude and GPT-OSS models; `/agy-model` picks the model). Use it for work that benefits from a stronger or different model at no per-token cost. An agy worker needs a git repo and has no `owns`, `pi_btw`, manager role or guard checks, so keep it to self-contained dev/general tasks and review its diff as usual.
+Workers run on Pi by default. Pass `backend: "agy"` to run one on the Antigravity CLI (the user's Google AI Pro account: Gemini, Claude and GPT-OSS models; `/agy-model` picks the model). Use it for work that benefits from a stronger or different model at no per-token cost. An agy worker needs a git repo and has no `owns`, manager role or guard checks (`pi_btw` works, answered from its recent activity), so keep it to self-contained dev/general tasks and review its diff as usual.
 
 ## Scheduling, safety and cost
 

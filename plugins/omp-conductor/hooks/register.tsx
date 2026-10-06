@@ -2734,11 +2734,10 @@ export const register: Register = on => {
         const reply = (message: string, error = false) => ({ message, error })
         const w = workers.get(id)
         if (!w) return reply(`no worker ${id}`, true)
-        if (w.backend === 'agy') return reply('pi_btw is not available for agy workers (it needs the Pi extension); use pi_log or pi_digest', true)
         const scopeError = caller ? managerChildScope(caller, w) : orchestratorScopeError(w)
         if (scopeError) return reply(scopeError, true)
         if (w.state !== 'running') return reply(`${id} is ${w.state}; pi_btw only works on a running worker. Use pi_digest for its result or pi_send to continue it.`, true)
-        if (!w.send) return reply(`${id} has no live Pi process; use pi_digest to read its result or pi_send to resume it.`, true)
+        if (!w.send) return reply(`${id} has no live ${w.backend === 'agy' ? 'agy' : 'Pi'} process; use pi_digest to read its result or pi_send to resume it.`, true)
         if (w.btwPending) return reply(`${id} already has a btw request in progress; wait for it to finish.`, true)
 
         const now = Date.now()
@@ -2751,6 +2750,41 @@ export const register: Register = on => {
         }
 
         const q = (typeof question === 'string' ? question : '').trim().replace(/\s+/g, ' ') || DEFAULT_BTW_QUESTION
+        if (w.backend === 'agy') {
+          // agy's own /btw is TUI-only (refused in print mode, and a mid-turn message waits for the turn to end), so the answer
+          // comes from a separate one-shot agy call on a fast model, fed the worker's task, recent events and running tool.
+          w.btwAt = now
+          w.btwCount = (w.btwCount ?? 0) + 1
+          w.btwPending = 'agy'
+          void B?.sync()
+          const quietS = w.lastAt ? Math.round((Date.now() - w.lastAt) / 1000) : 0
+          const head = `[${w.id}] ${w.state} · elapsed ${elapsed(w)} · last activity: ${w.last || 'none'}${quietS ? ` · last event ${quietS}s ago` : ''}`
+          const lastTool = [...(w.recentActivity ?? [])].reverse().find(a => a.kind === 'tool')
+          const prompt = [
+            "You are a status reporter answering a supervisor's side question about a coding worker that is still running. Use ONLY the facts below. Do not use any tools and do not touch any files. Plain prose, at most 5 sentences: what it is doing right now (name the running tool call), why it may be slow, what is left, and whether it looks stuck or looping.",
+            `TASK GIVEN TO THE WORKER:\n${clip(w.task, 1500)}`,
+            `STATE: ${head}`,
+            lastTool ? `LAST TOOL CALL: ${lastTool.tool} ${clip(one(JSON.stringify(lastTool.args ?? {})), 300)}` : 'LAST TOOL CALL: none yet',
+            `RECENT EVENTS (oldest first):\n${w.events.slice(-30).join('\n')}`,
+            w.texts.length ? `LAST TEXT FROM THE WORKER:\n${clip(w.texts[w.texts.length - 1]!, 800)}` : '',
+            `QUESTION: ${q}`,
+          ].filter(Boolean).join('\n\n')
+          const waitSec = Math.min(Math.max(Number(timeoutSec ?? 60) || 60, 5), 90)
+          try {
+            const r = await $.process.run(['agy', '--output-format', 'json', '--dangerously-skip-permissions', '--model', 'gemini-3.8-flash-low', `--print=${prompt}`], { cwd: `${agentDir}/tmp`, timeoutMs: waitSec * 1000 })
+            if (r.exitCode !== 0) return reply(`${head}\nagy btw failed (exit ${r.exitCode}): ${clip(one(r.stderr || r.stdout), 200)}`, true)
+            let answer = r.stdout.trim()
+            try {
+              const parsed = JSON.parse(answer) as { response?: string; result?: { response?: string } }
+              answer = String(parsed.response ?? parsed.result?.response ?? answer).trim()
+            } catch { /* plain text output */ }
+            return reply(`${head}\n${answer || 'agy returned an empty answer'}`)
+          } catch (err) {
+            return reply(`${head}\nagy btw failed: ${String(err)}`, true)
+          } finally {
+            w.btwPending = undefined
+          }
+        }
         const reqId = `${now.toString(36)}${(++btwSeq).toString(36)}`
         const btwDir = (w.btwDir ??= `${agentDir}/run/${w.pathKey ?? `${w.sessionId ?? sid}-${w.id}`}.btw`)
         const file = `${btwDir}/${reqId}.json`
