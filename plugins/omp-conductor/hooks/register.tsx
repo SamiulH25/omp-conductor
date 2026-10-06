@@ -266,7 +266,6 @@ const DENY = /\/\.(ssh|gnupg|aws|kube|docker)(\/|$)/
 // Workers are Pi (https://pi.dev) RPC processes: one long-lived `pi --mode rpc` per worker, so a worker keeps
 // what it learned and can be recalled for fixes. They run in their own Pi agent dir (own prompt, models, sessions).
 // The only model workers ever use. /pi-model changes it and the choice is kept in the store.
-const SUMMARY_MODEL = 'haiku' // the one other model: compresses a long worker reply that has no SUMMARY block
 const DEFAULT_MODEL = 'opencode-go/deepseek-v4.1-flash'
 const DEFAULT_THINKING = 'low' // reasoning effort workers start with; /pi-effort changes it
 const DEFAULT_BTW_QUESTION = 'What exactly are you doing right now, why is it taking this long, what is left, and are you stuck?'
@@ -783,7 +782,6 @@ type Bridge = {
   review: (w: Worker) => Promise<void>
   changed: (w: Worker) => Promise<string[] | undefined>
   nonGitDiff: (w: Worker, cap: number) => Promise<string>
-  summarize: (text: string) => Promise<string | undefined>
   git: (
     args: string[],
     cwd: string,
@@ -1483,11 +1481,6 @@ export const register: Register = on => {
       lines.push(`report${final.length > cap ? ` (first ${cap} of ${final.length} chars; detail:"full" for more)` : ''}:`, clip(final, cap))
     } else if (own) {
       lines.push(`summary (worker's own): ${clip(own, 800)}`)
-    } else if (final && final.length > FINAL_CHARS && !full) {
-      w.summary ??= await B?.summarize(final)
-      lines.push(
-        w.summary ? `summary (haiku): ${w.summary}` : `final: ${clip(final, FINAL_CHARS)}`,
-      )
     } else if (final) {
       lines.push(`final: ${clip(final, full ? 4000 : FINAL_CHARS)}`)
     } else lines.push(`last action: ${w.last || 'none yet'}`)
@@ -1847,16 +1840,6 @@ export const register: Register = on => {
     }
 
     B = {
-      summarize: async body => {
-        const r = await $.model.complete({
-          model: SUMMARY_MODEL,
-          maxTokens: 220,
-          system: 'You compress the final reply of a coding worker for its supervisor. Always produce the summary; never refuse, never ask for more input, never comment on the request. Be factual and add nothing the text does not say.',
-          prompt: `Summarize the text below in at most 5 short bullets (under 100 words). Cover what was done, files touched, what failed or was skipped, and open questions where the text mentions them; if it is not a work report, summarize its content.\n\n<text>\n${clip(body, 6000)}\n</text>`,
-        })
-        return r.isAnswered ? r.text.trim() : undefined
-      },
-
       ledger: async (cost, tokens, spawned, worker) => {
         await update($, ledgerAtom, l => ({
           cost: (l?.cost ?? 0) + cost,

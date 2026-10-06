@@ -38,7 +38,7 @@ The `orchestrate-pi` skill describes two modes; say which you want.
 |---|---|
 | `pi_spawn` | Start a worker in the background (`task`, `agent`, `dir`, `title`, `maxMinutes`, `worktree`, `effort`, `verify`, `verifyTimeoutSec`, `fixRounds`, `expect`, `checks`, `skills`, `noDict`, `owns`, `after`, `maxCost`, `reviewBy`, `codex`). Returns an id at once, or queues the worker when all 4 slots are busy. `skills` pushes skills Claude has (project/user `.claude/skills` and installed plugins, e.g. `godot-prompter:state-machine`) onto the worker with Pi's `--skill`. A `dev`/`general` worker is refused until the project has a dictionary (`pi_dict`), unless `noDict: true`. |
 | `pi_status` | One line per worker, with live tok/s and cost, plus the session total. |
-| `pi_digest` | Compact report: files, commands, errors, git status, and the worker's own summary (when a worker gives none and its reply is long, Claude Haiku compresses it, labelled `summary (haiku)`). `detail: "full"` adds recent events. |
+| `pi_digest` | Compact report: files, commands, errors, git status, and the worker's own summary (its own `SUMMARY:` block, or its final reply clipped when it gave none; nothing is summarized by another model). `detail: "full"` adds recent events. |
 | `pi_wait` | Blocks (default 300 s, max 900) until something happens, then returns digests of what changed: by default it returns immediately when the first watched worker finishes, fails, is killed, starts after queueing, or gets a new ⚠ warning, so one call replaces many polls. `mode: "all"` waits for every watched worker, `"any"` for the first to finish. |
 | `pi_log` | A worker's recent activity (tool calls, errors, text) by event index, to debug a bad run. |
 | `pi_race` | Best-of-N: the same task on 2-4 workers (optionally different models); `pi_wait` ranks the results (checks/verify passed, fewer warnings, smaller diff). |
@@ -99,7 +99,7 @@ An agy worker is one `agy --input-format stream-json` process fed by the same co
 | `explore` | read, grep, find, ls (read-only) | no | Long `FINDINGS:` report: file:line evidence, quoted code, what was searched and not found, verified vs inferred. Never summarized or compressed |
 | `review` | read, grep, find, ls (read-only) | no | `FINDINGS:` ordered by severity, each with file:line, failure scenario and fix. Never summarized or compressed |
 
-Detailed types (`explore`, `review`) show the whole report in `pi_digest` (a 60000-char guard applies; `detail: "full"` raises it to 200000) and a count of files read; the Haiku compression is only ever used for `general` and `dev`. The type shows on the worker card. Types are defined in the `AGENTS` table in `hooks/register.tsx`.
+Detailed types (`explore`, `review`) show the whole report in `pi_digest` (a 60000-char guard applies; `detail: "full"` raises it to 200000) and a count of files read. The type shows on the worker card. Types are defined in the `AGENTS` table in `hooks/register.tsx`.
 
 ## How it talks to Pi
 
@@ -134,7 +134,7 @@ Every worker loads `extensions/guard.ts` (a Pi extension passed with `-e`; all o
 
 - Every worker runs with the effort set by `/pi-effort`, `low` by default (`DEFAULT_THINKING` in `hooks/register.tsx`).
 - Cost comes from Pi's own per-turn usage numbers and is shown on every card, in the digest, in `pi_status`, in the status line and as a session total. The session total lives in session state, so it survives hot reloads and resets with a new session.
-- Workers only ever use one model: `opencode-go/deepseek-v4.1-flash` by default (`DEFAULT_MODEL` in `hooks/register.tsx`). Claude cannot pick another per task. The one other model the plugin touches is Claude Haiku, used only to compress a long worker reply that has no summary of its own (a short call through your Claude session, not a Pi worker). Change it with `/pi-model` (below).
+- Workers only ever use one model: `opencode-go/deepseek-v4.1-flash` by default (`DEFAULT_MODEL` in `hooks/register.tsx`). Claude cannot pick another per task. The plugin makes no other model calls: digests show what the worker itself reported, and `pi_btw` covers questions about a running worker. Change it with `/pi-model` (below).
 - Every task gets its agent type's reporting instruction appended: a short `SUMMARY:` block for `general` and `dev`, a complete `FINDINGS:` report for `explore` and `review`.
 - At most 4 concurrent workers, each with a hard time limit (default 20 min; 15 for `explore` and `review`). Directories must be under your home directory or `/tmp`, and not `.ssh`, `.gnupg`, `.aws`, `.kube` or `.docker`.
 - Pi has no approval prompts: workers run every tool call with your user's permissions, which is why `dev` and `general` workers run in worktrees by default.
