@@ -81,6 +81,70 @@ function detectStuck(
 
 // Inline copies are needed because the hook loader may not resolve runtime relative imports.
 // extensions/owns.ts is the tested copy used by guard.ts; keep these helpers in sync with it.
+// agy (Antigravity CLI) backend: its NDJSON stream translated into the Pi events the worker parser already reads. Tested copy: tests/agy-logic.mjs.
+function agyToolName(name: any) {
+  const n = String(name ?? 'tool')
+  if (n === 'run_command') return 'bash'
+  if (['write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file', 'notebook_edit'].includes(n)) return 'edit'
+  if (['view_file', 'list_dir', 'grep_search', 'find_by_name'].includes(n)) return 'read'
+  return n
+}
+
+function agyToolArgs(params: any) {
+  const p = params && typeof params === 'object' ? params : {}
+  const path = p.TargetFile ?? p.AbsolutePath ?? p.SearchPath ?? p.DirectoryPath ?? p.path
+  const out = { ...p }
+  if (typeof p.CommandLine === 'string') out.command = p.CommandLine
+  if (typeof path === 'string') out.path = path
+  return out
+}
+
+function agyEventsToPi(ev: any, st: any) {
+  const out = new Array()
+  if (!ev || typeof ev !== 'object') return out
+  if (ev.event === 'init') {
+    const id = ev.conversation_id ?? ev.init?.conversation_id
+    if (id) out.push({ type: 'response', command: 'get_state', success: true, data: { sessionId: id } })
+    return out
+  }
+  if (ev.event === 'step_update' && ev.step_update) {
+    const s = ev.step_update
+    const idx = String(s.step_index)
+    if (s.step_type === 'agent_response') {
+      if (st.turns[idx] === undefined) {
+        st.turns[idx] = ''
+        out.push({ type: 'turn_start' })
+      }
+      if (typeof s.text_delta === 'string' && s.text_delta) {
+        st.turns[idx] += s.text_delta
+        out.push({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: s.text_delta } })
+      }
+      if (s.state === 'DONE') {
+        const text = st.turns[idx].trim()
+        if (text) out.push({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: text } })
+        const u = s.usage ?? {}
+        out.push({ type: 'turn_end', message: { role: 'assistant', usage: { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0, cacheRead: u.cache_read_tokens ?? 0, cost: { total: 0 } } } })
+      }
+    } else if (s.step_type === 'tool') {
+      const info = s.tool_info ?? {}
+      const toolName = agyToolName(s.tool_name)
+      const toolCallId = `${s.conversation_id}:${idx}`
+      if (s.state === 'ACTIVE') out.push({ type: 'tool_execution_start', toolCallId, toolName, args: agyToolArgs(info.parameters) })
+      else if (s.state === 'DONE' || /ERR|FAIL|CANCEL/i.test(String(s.state))) {
+        out.push({ type: 'tool_execution_end', toolCallId, toolName, isError: s.state !== 'DONE', result: { content: [{ text: typeof info.output === 'string' ? info.output : '' }], details: {} } })
+      }
+    }
+    return out
+  }
+  if (ev.event === 'result' && ev.result) {
+    const r = ev.result
+    if (r.status && r.status !== 'SUCCESS') out.push({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: String(r.error ?? r.status) } })
+    out.push({ type: 'agent_settled' })
+    st.turns = {}
+  }
+  return out
+}
+
 const normalize = (path: string) => path.replace(/\\/g, '/').replace(/^\.\//, '')
 
 function matchesGlob(pattern: string, path: string): boolean {
@@ -209,6 +273,7 @@ const DEFAULT_BTW_QUESTION = 'What exactly are you doing right now, why is it ta
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] // pi --thinking values
 // pi_spawn codex:true pins a worker to Codex (default GPT-6 Luna, any openai/* model via /codex-worker) through the ChatGPT sign-in of Pi's `openai` provider, at xhigh.
 const CODEX_MODEL = 'openai/gpt-6-luna' // default; /codex-worker changes it to any openai/* model
+const DEFAULT_AGY_MODEL = 'gemini-3.8-flash-high' // /agy-model changes it; `agy models` lists the ids
 const CODEX_THINKING = 'xhigh' // default; /codex-worker <model> <effort> changes it
 const CODEX_LOGIN = `Codex workers need a ChatGPT sign-in in the workers' own Pi agent dir (separate from your main Pi login, so the two never fight over token refreshes). Run once in a terminal:\n  PI_CODING_AGENT_DIR=~/.pi-workers pi\nthen /login → OpenAI → Sign in with ChatGPT, and quit Pi. No restart needed.`
 const MAX_SKILLS = 8 // per worker: each one costs a line in the system prompt and a read
@@ -475,6 +540,7 @@ function serializeWorkerRecord(w: any, sessionId: string, detailed: boolean) {
     checkRuns: (w.checkRuns ?? []).slice(-12),
     effort: w.effort,
     codex: w.codex,
+    backend: w.backend,
     skills: w.skills,
     owns: w.owns,
     marker: w.marker,
@@ -674,6 +740,9 @@ type Worker = {
   effort?: string // per-worker reasoning effort override
   effortSent?: string
   codex?: boolean // pinned to the /codex-worker model and effort at spawn, for its whole life, resumes included
+  backend?: 'pi' | 'agy' // agy: the Antigravity CLI (Google AI Pro account) instead of Pi
+  agyState?: { turns: Record<string, string> }
+  agyPreamble?: string // system text for an agy worker, sent ahead of its first prompt (agy has no system-prompt flag)
   skills?: Skill[] // skills the supervisor pushed (pi_spawn / pi_send): --skill on every process start
   owns?: string[] // file glob patterns this worker may edit
   marker?: string // non-git dirs: file whose mtime marks the spawn, for 'changed since' listings
@@ -908,6 +977,7 @@ export const register: Register = on => {
   let sessionBudgetWarned = false
   let currentThinking = DEFAULT_THINKING
   let codexModel = CODEX_MODEL
+  let agyModel = DEFAULT_AGY_MODEL
   let codexThinking = CODEX_THINKING
   let agentDir = ''
   let apiKey = ''
@@ -1167,10 +1237,14 @@ export const register: Register = on => {
     return (chars * w.ratio) / (span / 1000)
   }
 
-  const ingest = (w: Worker, raw: string) => {
+  const ingest = (w: Worker, raw: string, translated = false) => {
     let ev: any
     try {
       ev = JSON.parse(raw)
+      if (w.backend === 'agy' && !translated && ev && typeof ev === 'object' && typeof ev.event === 'string') {
+        for (const piEvent of agyEventsToPi(ev, (w.agyState ??= { turns: {} }))) ingest(w, JSON.stringify(piEvent), true)
+        return
+      }
     } catch {
       // Pi prints plain-text errors (unknown model, bad flag) outside the JSON stream.
       w.stderr = (w.stderr + raw + '\n').slice(-2000)
@@ -1524,6 +1598,7 @@ export const register: Register = on => {
     currentThinking = THINKING_LEVELS.includes(savedThinking) ? savedThinking : DEFAULT_THINKING
     await update($, thinkingAtom, () => currentThinking)
     codexModel = String((await $.store.get('codexModel').catch(() => undefined)) || CODEX_MODEL)
+    agyModel = String((await $.store.get('agyModel').catch(() => undefined)) || DEFAULT_AGY_MODEL)
     const savedCodexThinking = String((await $.store.get('codexThinking').catch(() => undefined)) || '')
     codexThinking = THINKING_LEVELS.includes(savedCodexThinking) ? savedCodexThinking : CODEX_THINKING
     let lastSig = ''
@@ -1599,6 +1674,7 @@ export const register: Register = on => {
       checkRuns: w.checkRuns,
       effort: w.effort,
       codex: w.codex,
+      backend: w.backend,
       skills: w.skills,
       owns: w.owns,
       marker: w.marker,
@@ -2177,6 +2253,15 @@ export const register: Register = on => {
       const sys = [kind.role, jail, toolbox, skills, dict, handoff, sharedNotes].filter(Boolean).join('\n\n')
       if (sys) args.push('--append-system-prompt', sys)
       if (w.session) args.push('--session', w.session)
+      if (w.backend === 'agy') {
+        // The Antigravity CLI in persistent stream mode: one process, a JSON user message per prompt, a `result` event per turn.
+        // It has no system-prompt flag, so `sys` rides ahead of the first prompt; a resumed conversation already has it.
+        args.length = 0
+        args.push('--print=', '--input-format', 'stream-json', '--output-format', 'stream-json', '--dangerously-skip-permissions', '--model', w.model!)
+        if (w.session) args.push('--conversation', w.session)
+        w.agyState = { turns: {} }
+        w.agyPreamble = w.session ? undefined : sys
+      }
       w.effortSent = w.effort ?? currentThinking
       if (w.parent && workers.get(w.parent)?.state !== 'running') {
         w.killed = true
@@ -2185,12 +2270,34 @@ export const register: Register = on => {
         return false
       }
       const it = $.process
-        .spawn({ argv: ['bash', '-c', 'tail -n +1 -f --pid=$$ "$0" 2>/dev/null | pi "$@"', file, ...args], cwd: workDir(w), env: childEnv(w) })
+        .spawn({ argv: ['bash', '-c', `tail -n +1 -f --pid=$$ "$0" 2>/dev/null | ${w.backend === 'agy' ? 'agy' : 'pi'} "$@"`, file, ...args], cwd: workDir(w), env: childEnv(w) })
         [Symbol.asyncIterator]()
       let stopped = false
       w.send = async cmd => {
+        let line = JSON.stringify(cmd)
+        if (w.backend === 'agy') {
+          const type = String(cmd.type)
+          if (type === 'prompt' || type === 'steer' || type === 'follow_up') {
+            let content = String(cmd.message ?? '')
+            if (w.agyPreamble) {
+              content = `${w.agyPreamble}\n\n---\nYOUR TASK:\n${content}`
+              w.agyPreamble = undefined
+            }
+            line = JSON.stringify({ event: 'user', message: { content } })
+          } else if (type === 'abort') {
+            // agy has no in-process abort: end the process; the next prompt resumes the conversation by id.
+            stopped = true
+            w.send = undefined
+            w.stop = undefined
+            void it.return?.(undefined as never)
+            ingest(w, JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'aborted' } }), true)
+            ingest(w, JSON.stringify({ type: 'agent_settled' }), true)
+            void $.process.run(['rm', '-f', file], { timeoutMs: 5000 }).catch(() => undefined)
+            return
+          } else return // get_state, set_thinking_level and the other Pi commands have no agy equivalent
+        }
         await $.process
-          .run(['bash', '-c', 'printf "%s\\n" "$1" >> "$0"', file, JSON.stringify(cmd)], { timeoutMs: 10_000 })
+          .run(['bash', '-c', 'printf "%s\\n" "$1" >> "$0"', file, line], { timeoutMs: 10_000 })
           .catch(() => undefined)
       }
       w.stop = () => {
@@ -2238,7 +2345,7 @@ export const register: Register = on => {
           w.send = undefined
           w.stop = undefined
           if (w.state === 'running') {
-            w.runError ??= `pi exited${code != null ? ` ${code}` : ''} before the run finished${w.stderr.trim() ? `: ${clip(one(w.stderr), 160)}` : ''}`
+            w.runError ??= `${w.backend === 'agy' ? 'agy' : 'pi'} exited${code != null ? ` ${code}` : ''} before the run finished${w.stderr.trim() ? `: ${clip(one(w.stderr), 160)}` : ''}`
             w.errors.push(w.runError)
             finish(w)
           }
@@ -2282,6 +2389,8 @@ export const register: Register = on => {
           owns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns of files this worker may edit (relative to its dir/worktree root); use owned patterns so parallel workers avoid merge conflicts.' },
           expect: { type: 'array', items: { type: 'string' }, description: 'Paths (relative to dir) the task must change. If the worker finishes without changing one, the digest, status and wake-up message carry a warning.' },
           effort: { type: 'string', enum: THINKING_LEVELS, description: 'Reasoning effort for this worker only (default: the /pi-effort setting). Raise it for tasks that need real reasoning.' },
+          backend: { type: 'string', enum: ['pi', 'agy'], description: 'Worker runtime: pi (default) or agy, the Antigravity CLI on the user\'s Google AI Pro account (model set with /agy-model or the model param; needs a git repo; no owns, btw, manager or guard features).' },
+          model: { type: 'string', description: 'With backend agy: the agy model id (see /agy-model list), default the /agy-model setting.' },
           codex: { type: 'boolean', description: `Run this worker on Codex (the /codex-worker model, default ${CODEX_MODEL}, via the user's ChatGPT subscription) at the /codex-worker effort (default ${CODEX_THINKING}) instead of the /pi-model model; effort cannot be combined with it. Slower and stronger: use it for hard reasoning, tricky bugs and careful reviews, not routine edits.` },
           skills: { type: 'array', items: { type: 'string' }, description: `Skills to push onto this worker, named as you know them (e.g. "godot-prompter:state-machine", a bare skill name, or a path to a skill dir). Pick the ones that match what the task touches: the worker reads them before working in that area. Max ${MAX_SKILLS}. From the project's .claude/skills, ~/.claude/skills and installed plugins.` },
           noDict: { type: 'boolean', description: 'Skip the project-dictionary requirement for a dev/general worker (the first one in a project is refused until pi_dict has entries).' },
@@ -2490,6 +2599,7 @@ export const register: Register = on => {
     await $.command.register({ name: 'pi-model', description: 'Show or change the global or per-agent-type model Pi workers use' })
     await $.command.register({ name: 'pi-agents', description: 'List built-in and user-defined Pi worker types' })
     await $.command.register({ name: 'pi-budget', description: 'Show or change the session USD budget for Pi workers' })
+    await $.command.register({ name: 'agy-model', description: 'Show, list or change the model agy (Antigravity) workers use' })
     await $.command.register({ name: 'codex-worker', description: 'Show or change the Codex model and effort used by codex:true workers' })
     await $.command.register({ name: 'btw', description: 'Ask a running worker why it is slow or quiet without interrupting it' })
     await $.command.register({ name: 'pi-effort', description: 'Show or change the reasoning effort every Pi worker uses' })
@@ -2624,6 +2734,7 @@ export const register: Register = on => {
         const reply = (message: string, error = false) => ({ message, error })
         const w = workers.get(id)
         if (!w) return reply(`no worker ${id}`, true)
+        if (w.backend === 'agy') return reply('pi_btw is not available for agy workers (it needs the Pi extension); use pi_log or pi_digest', true)
         const scopeError = caller ? managerChildScope(caller, w) : orchestratorScopeError(w)
         if (scopeError) return reply(scopeError, true)
         if (w.state !== 'running') return reply(`${id} is ${w.state}; pi_btw only works on a running worker. Use pi_digest for its result or pi_send to continue it.`, true)
@@ -2688,8 +2799,14 @@ export const register: Register = on => {
           if ((w.btwResponse as Worker['btwResponse'])?.id === reqId) w.btwResponse = undefined
         }
       }
+      const agyReady = async () => {
+        const r = await $.process.run(['bash', '-c', 'command -v agy'], { timeoutMs: 10_000 }).catch(() => undefined)
+        return r && r.exitCode === 0 ? undefined : 'the agy CLI (Antigravity) is not on PATH: install the antigravity-cli package, run `agy` once to sign in with your Google account, then try again'
+      }
       spawnWorker = async (e: Record<string, any>, options: { model?: string; raceBatch?: string; caller?: Worker; onCreated?: (w: Worker) => void } = {}) => {
-        const notReady = await ensureSetup()
+        if (e.backend !== undefined && e.backend !== 'pi' && e.backend !== 'agy') return text('backend must be "pi" or "agy"', true)
+        const agyBackend = e.backend === 'agy'
+        const notReady = agyBackend ? await agyReady() : await ensureSetup()
         if (notReady) return text(notReady, true)
         const catalog = await loadAgentCatalog()
         const task = String(e.task ?? '').trim()
@@ -2743,6 +2860,13 @@ export const register: Register = on => {
         } else if (e.reviewBy !== undefined && e.reviewBy !== false) return text('reviewBy must be a boolean or {codex?, effort?}', true)
         if (reviewBy && !['dev', 'general'].includes(agent)) return text('reviewBy is available only for dev/general workers', true)
         if (reviewBy?.codex && !(await codexReady())) return text(CODEX_LOGIN, true)
+        if (agyBackend) {
+          if (agent === 'manager') return text('manager workers run on Pi (they need the sub_* extension); use backend pi', true)
+          if (caller) return text('sub-workers always run on Pi', true)
+          if (owns?.length) return text('owns is enforced by the Pi worker guard and is not available for agy workers', true)
+          if (e.codex === true) return text('codex:true and backend agy cannot be combined', true)
+          if (e.effort !== undefined) return text('agy reasoning effort is part of the model id (-low/-medium/-high): pass model instead of effort', true)
+        } else if (e.model !== undefined) return text('model is only valid with backend agy (Pi workers use /pi-model)', true)
         if (e.reviewRounds !== undefined && (typeof e.reviewRounds !== 'number' || !Number.isInteger(e.reviewRounds) || e.reviewRounds < 0 || e.reviewRounds > 2)) return text('reviewRounds must be an integer from 0 to 2', true)
         const reviewRoundsLeft = reviewBy ? (e.reviewRounds === undefined ? 1 : Number(e.reviewRounds)) : undefined
         const dir = caller ? caller.worktree ?? caller.dir : String(e.dir ?? cwd)
@@ -2795,7 +2919,8 @@ export const register: Register = on => {
             }
           } else checks = Object.entries(tools.checks).filter(([, c]) => c.required).map(([n]) => n)
         }
-        const wantTree = caller ? isGit : agent === 'manager' ? isGit : e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
+        if (agyBackend && !isGit) return text('agy workers need a git repo: their changes are reviewed through a worktree diff', true)
+        const wantTree = caller ? isGit : agent === 'manager' ? isGit : agyBackend && e.worktree !== false ? isGit : e.worktree === undefined ? kind.worktree === 'auto' && isGit : e.worktree === true
         if (wantTree && !isGit) return text('worktree requested but dir is not a git repo', true)
         if (caller && !isGit) return text('sub-workers require the manager integration branch to be a git worktree', true)
         seq += 1
@@ -2859,7 +2984,8 @@ export const register: Register = on => {
           worktree,
           sub,
           branch,
-          model: options.model ?? (codex ? resolveWorkerModel(agent, true, codexModel, modelOverrides, currentModel) : kind.model ?? resolveWorkerModel(agent, false, codexModel, modelOverrides, currentModel)),
+          backend: agyBackend ? 'agy' : undefined,
+          model: agyBackend ? String(e.model || agyModel) : options.model ?? (codex ? resolveWorkerModel(agent, true, codexModel, modelOverrides, currentModel) : kind.model ?? resolveWorkerModel(agent, false, codexModel, modelOverrides, currentModel)),
           codex: codex || undefined,
           reviewBy,
           reviewRoundsLeft,
@@ -3373,6 +3499,31 @@ export const register: Register = on => {
     if (!id) return { text: 'usage: /btw <id> [question]' }
     const result = await askBtw(id, question.join(' '), 60, false)
     return { text: result.message }
+  })
+
+  on('command.run', { command: 'agy-model' }, async ($, e) => {
+    const arg = String((e as { args?: string }).args ?? '').trim()
+    const status = `agy worker model: ${agyModel}${agyModel === DEFAULT_AGY_MODEL ? ' (plugin default)' : ` (plugin default is ${DEFAULT_AGY_MODEL})`}`
+    const listModels = async () => {
+      const r = await $.process.run(['agy', 'models'], { timeoutMs: 60_000 }).catch(() => undefined)
+      if (!r || r.exitCode !== 0) return undefined
+      return r.stdout.split('\n').map(l => l.split('\t')[0]!.trim()).filter(id => /^[a-z0-9][\w.-]*$/i.test(id))
+    }
+    if (!arg) return { text: `${status}\nChange it: /agy-model <id or part of a name>. List: /agy-model list. Reset: /agy-model reset. Start one with pi_spawn backend:"agy" (optional model).` }
+    if (arg === 'reset' || arg === 'default') {
+      agyModel = DEFAULT_AGY_MODEL
+      await $.store.set('agyModel', agyModel).catch(() => undefined)
+      return { text: `agy worker model reset to ${DEFAULT_AGY_MODEL}.` }
+    }
+    const models = await listModels()
+    if (!models) return { text: `could not run \`agy models\` (is the agy CLI installed and signed in?). ${status}` }
+    if (arg === 'list') return { text: `${models.join('\n')}\n${status}` }
+    const hits = models.includes(arg) ? [arg] : models.filter(id => id.includes(arg))
+    if (!hits.length) return { text: `no agy model matches "${arg}". ${status}` }
+    if (hits.length > 1) return { text: `${hits.length} models match "${arg}"; pass the exact id:\n${hits.map(id => `  ${id}`).join('\n')}\n${status}` }
+    agyModel = hits[0]!
+    await $.store.set('agyModel', agyModel).catch(() => undefined)
+    return { text: `agy worker model set to ${agyModel}. Applies to agy workers spawned from now on.` }
   })
 
   on('command.run', { command: 'codex-worker' }, async ($, e) => {
